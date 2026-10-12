@@ -61,6 +61,8 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/q4k-skinny.cuh"  // port of llama.cpp-v100 v100-1.1.1 (MIT)
+#include "ggml-cuda/q8-skinny.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -1687,6 +1689,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
+    // the mul_mat_vec fusions cannot read a repacked Q4_K weight; a plain pair is fused by
+    // the skinny gated kernel instead (ported from llama.cpp-v100 v100-1.1.1, MIT)
+    if (ggml_cuda_q4k_skinny_is_repacked(ffn_up->src[0]) || ggml_cuda_q4k_skinny_is_repacked(ffn_gate->src[0])) {
+        return false;
+    }
+
     if (!is_mul_mat && !is_mul_mat_id) {
         return false;
     }
@@ -1764,6 +1772,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (ggml_cuda_q8_skinny_is_repacked(src0) || ggml_cuda_q4k_skinny_is_repacked(src0)) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -1791,6 +1803,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (ggml_cuda_q8_skinny_is_repacked(src0) || ggml_cuda_q4k_skinny_is_repacked(src0)) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -1815,8 +1831,24 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// skinny fallback wrappers (ported from llama.cpp-v100 v100-1.1.1, MIT): repacked weights
+// that the small-M skinny kernels cannot handle are expanded to dense F16 and sent back
+// through the regular path.
+static void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (ggml_cuda_q8_skinny_is_repacked(src0)) {
+        ggml_cuda_mul_mat_q8_skinny(ctx, src0, src1, dst);
+        return;
+    }
+
+    if (ggml_cuda_q4k_skinny_is_repacked(src0)) {
+        ggml_cuda_mul_mat_q4k_skinny(ctx, src0, src1, dst);
+        return;
+    }
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
@@ -1872,6 +1904,52 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+// skinny fallback wrappers (ported from llama.cpp-v100 v100-1.1.1, MIT): repacked weights
+// the small-M kernels cannot handle are expanded to dense F16 and sent through the regular path.
+static void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_q8_skinny_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(src0));
+    ggml_cuda_q8_skinny_to_f16(src0, src0_f16.get(), ctx.stream());
+
+    ggml_tensor src0_tmp = *src0;
+    src0_tmp.type = GGML_TYPE_F16;
+    src0_tmp.data = src0_f16.get();
+    src0_tmp.extra = nullptr;
+    src0_tmp.nb[0] = sizeof(half);
+    src0_tmp.nb[1] = src0_tmp.nb[0] * k;
+    src0_tmp.nb[2] = src0_tmp.nb[1] * n;
+    src0_tmp.nb[3] = src0_tmp.nb[2];
+
+    ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
+}
+
+static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_q4k_skinny_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(src0));
+    ggml_cuda_q4k_skinny_to_f16(src0, src0_f16.get(), ctx.stream());
+
+    ggml_tensor src0_tmp = *src0;
+    src0_tmp.type = GGML_TYPE_F16;
+    src0_tmp.data = src0_f16.get();
+    src0_tmp.extra = nullptr;
+    src0_tmp.nb[0] = sizeof(half);
+    src0_tmp.nb[1] = src0_tmp.nb[0] * k;
+    src0_tmp.nb[2] = src0_tmp.nb[1] * n;
+    src0_tmp.nb[3] = src0_tmp.nb[2];
+
+    ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
+}
+
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2059,6 +2137,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // A repacked Q8_0/Q4_K tensor only carries weights for MUL_MAT src0; anything else reading
+    // it would interpret the repacked bytes as the quantized type, so abort loudly instead of
+    // computing garbage. (ported from llama.cpp-v100 v100-1.1.1, MIT)
+    if (dst->op != GGML_OP_MUL_MAT ||
+            (dst->src[1] != nullptr && (ggml_cuda_q8_skinny_is_repacked(dst->src[1]) || ggml_cuda_q4k_skinny_is_repacked(dst->src[1])))) {
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const ggml_tensor * src = dst->src[i];
+            if (src == nullptr) {
+                continue;
+            }
+            if (ggml_cuda_q8_skinny_is_repacked(src) || ggml_cuda_q4k_skinny_is_repacked(src) ||
+                (src->view_src != nullptr && (ggml_cuda_q8_skinny_is_repacked(src->view_src) || ggml_cuda_q4k_skinny_is_repacked(src->view_src)))) {
+                GGML_ABORT("%s: op %s reads a repacked tensor %s", __func__, ggml_op_name(dst->op), src->name);
+            }
+        }
+    }
+
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -4437,6 +4532,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_cuda_q8_skinny_prepass(*cuda_ctx, cgraph);
+    ggml_cuda_q4k_skinny_prepass(*cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
