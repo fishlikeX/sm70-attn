@@ -3534,6 +3534,60 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// shared-src1 MUL_MAT group matcher for the skinny multi-weight kernel
+// (ported from llama.cpp-v100 v100-1.1.1, MIT)
+static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_idx,
+                                         const ggml_tensor * src0s[4], ggml_tensor * dsts[4],
+                                         bool q4k) {
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    if (first->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_tensor * src1 = first->src[1];
+    if (src1 == nullptr || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 || src1->ne[1] < 1 || src1->ne[1] > 64) {
+        return 0;
+    }
+    const int64_t k = first->src[0]->ne[0];
+    if (k % 32 != 0) {
+        return 0;
+    }
+    int n = 0;
+    while (n < 4 && node_idx + n < cgraph->n_nodes) {
+        ggml_tensor * node = cgraph->nodes[node_idx + n];
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1 ||
+                (node->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            break;
+        }
+        const ggml_tensor * w = node->src[0];
+        if (w->ne[0] != k) {
+            break;
+        }
+        if (q4k) {
+            if (!ggml_cuda_q4k_skinny_is_repacked(w) || w->type != first->src[0]->type) {
+                break;
+            }
+        } else {
+            if (ggml_cuda_q4k_skinny_is_repacked(w)) {
+                break;
+            }
+            const bool repacked = ggml_cuda_q8_skinny_is_repacked(w);
+            const bool narrow = w->type == GGML_TYPE_Q8_0 && w->view_src == nullptr && w->op == GGML_OP_NONE &&
+                                w->ne[1] % 32 != 0;
+            if (!repacked && (!narrow || src1->ne[1] > 16)) {
+                break;
+            }
+        }
+        if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
+            break;
+        }
+        src0s[n] = w;
+        dsts[n]  = node;
+        ++n;
+    }
+    return n >= 2 ? n : 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3792,6 +3846,53 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         GGML_ASSERT(bias_node->src[0] == mul_node);
         return bias_node->src[1];
     };
+
+    // skinny gated pair + skinny multi-weight fusion (ported from llama.cpp-v100 v100-1.1.1, MIT).
+    // Qwen3.5/3.8 FFN carries no ffn bias, so gate/up/GLU are graph-adjacent: match the bare
+    // triple directly and let the repacked kernels write GLU in one launch. Runs before the
+    // generic scale/bias lanes; non-repacked weights fall through untouched.
+    if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes) {
+        const ggml_tensor * gluN  = cgraph->nodes[i + 2];
+        const ggml_tensor * gateN = cgraph->nodes[i];
+        const ggml_tensor * upN   = cgraph->nodes[i + 1];
+        if (gluN->op == GGML_OP_GLU && ggml_get_glu_op(gluN) == GGML_GLU_OP_SWIGLU &&
+                gluN->src[0]->op == GGML_OP_MUL_MAT && gluN->src[1]->op == GGML_OP_MUL_MAT &&
+                gluN->src[0]->src[1] == gluN->src[1]->src[1] &&
+                gluN->src[0] == gateN && gluN->src[1] == upN) {
+            const ggml_tensor * gateW = gateN->src[0];
+            const ggml_tensor * upW   = upN->src[0];
+            const ggml_tensor * src1  = upN->src[1];
+            const bool q4k = ggml_cuda_q4k_skinny_is_repacked(gateW);
+            const bool both = q4k ? (ggml_cuda_q4k_skinny_is_repacked(gateW) && ggml_cuda_q4k_skinny_is_repacked(upW))
+                                  : (ggml_cuda_q8_skinny_is_repacked(gateW) && ggml_cuda_q8_skinny_is_repacked(upW));
+            if (both && gateW->type == upW->type) {
+                const ggml_op glu_ops[3] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+                const int     glu_out[1] = { i + 2 };
+                if (ggml_can_fuse_subgraph(cgraph, i, 3, glu_ops, glu_out, 1) &&
+                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, glu_out, 1) &&
+                        (q4k ? ggml_cuda_q4k_skinny_mul_mat_gated(*cuda_ctx, gateW, upW, src1, (ggml_tensor *) gluN)
+                             : ggml_cuda_q8_skinny_mul_mat_gated(*cuda_ctx, gateW, upW, src1, (ggml_tensor *) gluN))) {
+                    return 2;
+                }
+            }
+        }
+    }
+
+    // several MUL_MAT nodes sharing one src1: one input conversion + one multi-weight launch
+    if (node->op == GGML_OP_MUL_MAT) {
+        const ggml_tensor * multi_src0[4];
+        ggml_tensor *       multi_dst[4];
+        const bool q4k = ggml_cuda_q4k_skinny_is_repacked(node->src[0]);
+        const int  n_multi = ggml_cuda_match_mul_mat_multi(cgraph, i, multi_src0, multi_dst, q4k);
+        if (n_multi >= 2) {
+            const int out_nodes[1] = { i + n_multi - 1 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_multi, out_nodes, 1) &&
+                    (q4k ? ggml_cuda_q4k_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1])
+                         : ggml_cuda_q8_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1]))) {
+                return n_multi - 1;
+            }
+        }
+    }
 
     // gate + glu + up, with optional scale/bias on both lanes.
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
