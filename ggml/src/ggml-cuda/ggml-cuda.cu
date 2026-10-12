@@ -62,6 +62,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/q4k-skinny.cuh"  // port of llama.cpp-v100 v100-1.1.1 (MIT)
+#include "ggml-cuda/iq-skinny.cuh"  // IQ codec family (T2), same lineage
 #include "ggml-cuda/q8-skinny.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
@@ -1772,7 +1773,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    if (ggml_cuda_q8_skinny_is_repacked(src0) || ggml_cuda_q4k_skinny_is_repacked(src0)) {
+    if (ggml_cuda_q8_skinny_is_repacked(src0) || ggml_cuda_q4k_skinny_is_repacked(src0) ||
+            ggml_cuda_iq_skinny_is_repacked(src0)) {
         return false;
     }
 
@@ -1803,7 +1805,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    if (ggml_cuda_q8_skinny_is_repacked(src0) || ggml_cuda_q4k_skinny_is_repacked(src0)) {
+    if (ggml_cuda_q8_skinny_is_repacked(src0) || ggml_cuda_q4k_skinny_is_repacked(src0) ||
+            ggml_cuda_iq_skinny_is_repacked(src0)) {
         return false;
     }
 
@@ -1836,6 +1839,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 // through the regular path.
 static void ggml_cuda_mul_mat_q8_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+static void ggml_cuda_mul_mat_iq_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -1847,6 +1851,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     if (ggml_cuda_q4k_skinny_is_repacked(src0)) {
         ggml_cuda_mul_mat_q4k_skinny(ctx, src0, src1, dst);
+        return;
+    }
+
+    if (ggml_cuda_iq_skinny_is_repacked(src0)) {
+        ggml_cuda_mul_mat_iq_skinny(ctx, src0, src1, dst);
         return;
     }
 
@@ -1937,6 +1946,30 @@ static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const 
     const int64_t n = src0->ne[1];
     ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(src0));
     ggml_cuda_q4k_skinny_to_f16(src0, src0_f16.get(), ctx.stream());
+
+    ggml_tensor src0_tmp = *src0;
+    src0_tmp.type = GGML_TYPE_F16;
+    src0_tmp.data = src0_f16.get();
+    src0_tmp.extra = nullptr;
+    src0_tmp.nb[0] = sizeof(half);
+    src0_tmp.nb[1] = src0_tmp.nb[0] * k;
+    src0_tmp.nb[2] = src0_tmp.nb[1] * n;
+    src0_tmp.nb[3] = src0_tmp.nb[2];
+
+    ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
+}
+
+static void ggml_cuda_mul_mat_iq_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_iq_skinny_mul_mat(ctx, src0, src1, dst)) {
+        return;
+    }
+
+    // the small-M kernel did not take it: expand the side buffer to dense F16 and use
+    // the regular path (same fallback model as the q8/q4k skinny wrappers)
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(src0));
+    ggml_cuda_iq_skinny_to_f16(src0, src0_f16.get(), ctx.stream());
 
     ggml_tensor src0_tmp = *src0;
     src0_tmp.type = GGML_TYPE_F16;
@@ -4636,6 +4669,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_q8_skinny_prepass(*cuda_ctx, cgraph);
     ggml_cuda_q4k_skinny_prepass(*cuda_ctx, cgraph);
+    ggml_cuda_iq_skinny_prepass(*cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

@@ -41,3 +41,16 @@ bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx, const g
 
 // Expands repacked weights to dense F16 [N][K], for M > 64.
 void ggml_cuda_q4k_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
+
+// Out-of-place variants for the IQ codec family (T2): codes and meta live in a side
+// buffer instead of the tensor, laid out exactly like the in-place stream
+// ([codes][meta], meta at codes + codes_bytes(n, k)). Implemented in this file so the
+// GEMM/repack templates stay in one translation unit.
+bool ggml_cuda_q4k_skinny_mul_mat_codes(ggml_type type, const uint8_t * codes, const half * input,
+                                        float * output, int n, int k, int m, cudaStream_t stream);
+void ggml_cuda_q4k_skinny_to_f16_codes(ggml_type type, const uint8_t * codes, half * dst,
+                                       int n, int k, cudaStream_t stream);
+// Repacks `src` (the original tensor bytes, left untouched) into codes + meta.
+void ggml_cuda_q4k_skinny_repack_side(ggml_type type, const void * src, uint8_t * codes,
+                                      uint8_t * meta, int n, int k, cudaStream_t stream);
+bool ggml_cuda_q4k_skinny_type_is_iq(ggml_type type);

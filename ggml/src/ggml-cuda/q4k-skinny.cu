@@ -10,6 +10,7 @@
 #include "convert.cuh"
 #include "q-skinny-common.cuh"
 #include "q4k-skinny.cuh"
+#include "iq-skinny.cuh"
 
 #include <algorithm>
 #include <vector>
@@ -1537,6 +1538,11 @@ static bool q4k_skinny_mul_mat_dispatch(ggml_type type, const uint8_t * codes, c
         case GGML_TYPE_Q4_K: return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_Q4_K>(codes, input, output, n, k, m, stream);
         case GGML_TYPE_Q5_K: return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_Q5_K>(codes, input, output, n, k, m, stream);
         case GGML_TYPE_Q6_K: return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_Q6_K>(codes, input, output, n, k, m, stream);
+        // IQ codec family (out-of-place, side buffers - T2)
+        case GGML_TYPE_IQ3_S:   return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_IQ3_S  >(codes, input, output, n, k, m, stream);
+        case GGML_TYPE_IQ3_XXS: return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_IQ3_XXS>(codes, input, output, n, k, m, stream);
+        case GGML_TYPE_IQ2_XS:  return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_IQ2_XS >(codes, input, output, n, k, m, stream);
+        case GGML_TYPE_IQ2_S:   return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_IQ2_S  >(codes, input, output, n, k, m, stream);
         default: GGML_ASSERT(!"q4k skinny: unknown type"); return false;
     }
 }
@@ -1891,6 +1897,48 @@ void ggml_cuda_q4k_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStrea
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ---- out-of-place entry points for the IQ codec family (T2) ----
+
+bool ggml_cuda_q4k_skinny_type_is_iq(ggml_type type) {
+    return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS ||
+           type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S;
+}
+
+bool ggml_cuda_q4k_skinny_mul_mat_codes(ggml_type type, const uint8_t * codes, const half * input,
+                                        float * output, int n, int k, int m, cudaStream_t stream) {
+    if (!ggml_cuda_q4k_skinny_type_is_iq(type)) {
+        return false;
+    }
+    return q4k_skinny_mul_mat_dispatch(type, codes, input, output, n, k, m, stream);
+}
+
+void ggml_cuda_q4k_skinny_to_f16_codes(ggml_type type, const uint8_t * codes, half * dst,
+                                       int n, int k, cudaStream_t stream) {
+    const dim3 grid((unsigned) (k / 256), (unsigned) (n / 32), 1);
+    switch (type) {
+        case GGML_TYPE_IQ3_S:   qskinny_to_f16_kernel<GGML_TYPE_IQ3_S  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
+        case GGML_TYPE_IQ3_XXS: qskinny_to_f16_kernel<GGML_TYPE_IQ3_XXS><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
+        case GGML_TYPE_IQ2_XS:  qskinny_to_f16_kernel<GGML_TYPE_IQ2_XS ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
+        case GGML_TYPE_IQ2_S:   qskinny_to_f16_kernel<GGML_TYPE_IQ2_S  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
+        default: GGML_ASSERT(!"iq skinny to_f16: unknown type");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_q4k_skinny_repack_side(ggml_type type, const void * src, uint8_t * codes,
+                                      uint8_t * meta, int n, int k, cudaStream_t stream) {
+    // the source tensor stays intact, so no staging copy is needed (unlike the in-place path)
+    switch (type) {
+        case GGML_TYPE_IQ3_S:   q4k_skinny_repack_tiles<GGML_TYPE_IQ3_S  >(src, codes, meta, n, k, 0, n / 32, stream); break;
+        case GGML_TYPE_IQ3_XXS: q4k_skinny_repack_tiles<GGML_TYPE_IQ3_XXS>(src, codes, meta, n, k, 0, n / 32, stream); break;
+        case GGML_TYPE_IQ2_XS:  q4k_skinny_repack_tiles<GGML_TYPE_IQ2_XS >(src, codes, meta, n, k, 0, n / 32, stream); break;
+        case GGML_TYPE_IQ2_S:   q4k_skinny_repack_tiles<GGML_TYPE_IQ2_S  >(src, codes, meta, n, k, 0, n / 32, stream); break;
+        default: GGML_ASSERT(!"iq skinny repack: unknown type");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 
 #else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 

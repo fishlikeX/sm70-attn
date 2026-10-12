@@ -427,3 +427,12 @@ template <> struct qskinny_codec<GGML_TYPE_IQ2_S> {
         iq_skinny_decode_32<3, dec>(records, scale2, out);
     }
 };
+
+// ---- IQ skinny runtime (out-of-place repack into side buffers), see iq-skinny.cu ----
+bool ggml_cuda_iq_skinny_can_repack(const ggml_tensor * t);
+bool ggml_cuda_iq_skinny_is_repacked(const ggml_tensor * t);
+void ggml_cuda_iq_skinny_repack(ggml_backend_cuda_context & ctx, ggml_tensor * t);
+void ggml_cuda_iq_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph);
+bool ggml_cuda_iq_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                 const ggml_tensor * src1, ggml_tensor * dst);
+void ggml_cuda_iq_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
