@@ -1694,11 +1694,7 @@ bool ggml_cuda_q4k_skinny_is_repacked(const ggml_tensor * t) {
 }
 
 bool ggml_cuda_skinny_env_disabled() {
-    static const bool disabled = [] {
-        const char * e = getenv("LLAMA_SM70_SKINNY");
-        return e != nullptr && e[0] == '0';
-    }();
-    return disabled;
+    return ggml_cuda_skinny_mode() == 0;
 }
 
 bool ggml_cuda_q4k_skinny_can_repack(const ggml_tensor * t) {
@@ -1888,7 +1884,13 @@ void ggml_cuda_q4k_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph *
     }
 
     for (ggml_tensor * t : candidates) {
-        ggml_cuda_q4k_skinny_repack_inplace(ctx, t);
+        if (ggml_cuda_skinny_mode() == 2) {
+            // side buffer: the original bytes survive, so the decode can fall back to
+            // the stock path (see ggml_cuda_mul_mat_iq_skinny)
+            ggml_cuda_iq_skinny_repack(ctx, t);
+        } else {
+            ggml_cuda_q4k_skinny_repack_inplace(ctx, t);
+        }
     }
 }
 
@@ -1916,9 +1918,64 @@ bool ggml_cuda_q4k_skinny_type_is_iq(ggml_type type) {
            type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S;
 }
 
+// codes/meta byte counts for every side-buffer-supported type (the codecs of both
+// families are visible in this TU)
+size_t ggml_cuda_skinny_codes_bytes(ggml_type type, int n, int k) {
+    switch (type) {
+        case GGML_TYPE_IQ3_S:   return qskinny_codec<GGML_TYPE_IQ3_S  >::codes_bytes(n, k);
+        case GGML_TYPE_IQ3_XXS: return qskinny_codec<GGML_TYPE_IQ3_XXS>::codes_bytes(n, k);
+        case GGML_TYPE_IQ2_XS:  return qskinny_codec<GGML_TYPE_IQ2_XS >::codes_bytes(n, k);
+        case GGML_TYPE_IQ2_S:   return qskinny_codec<GGML_TYPE_IQ2_S  >::codes_bytes(n, k);
+        case GGML_TYPE_Q2_K:    return qskinny_codec<GGML_TYPE_Q2_K   >::codes_bytes(n, k);
+        case GGML_TYPE_Q3_K:    return qskinny_codec<GGML_TYPE_Q3_K   >::codes_bytes(n, k);
+        case GGML_TYPE_Q4_K:    return qskinny_codec<GGML_TYPE_Q4_K   >::codes_bytes(n, k);
+        case GGML_TYPE_Q5_K:    return qskinny_codec<GGML_TYPE_Q5_K   >::codes_bytes(n, k);
+        case GGML_TYPE_Q6_K:    return qskinny_codec<GGML_TYPE_Q6_K   >::codes_bytes(n, k);
+        default:                GGML_ABORT("skinny: unknown type");
+    }
+}
+
+size_t ggml_cuda_skinny_meta_bytes(ggml_type type, int n, int k) {
+    const int mb = type == GGML_TYPE_IQ3_S   ? qskinny_codec<GGML_TYPE_IQ3_S  >::meta_bytes :
+                   type == GGML_TYPE_IQ3_XXS ? qskinny_codec<GGML_TYPE_IQ3_XXS>::meta_bytes :
+                   type == GGML_TYPE_IQ2_XS  ? qskinny_codec<GGML_TYPE_IQ2_XS >::meta_bytes :
+                   type == GGML_TYPE_IQ2_S   ? qskinny_codec<GGML_TYPE_IQ2_S  >::meta_bytes :
+                   type == GGML_TYPE_Q2_K    ? qskinny_codec<GGML_TYPE_Q2_K   >::meta_bytes :
+                   type == GGML_TYPE_Q3_K    ? qskinny_codec<GGML_TYPE_Q3_K   >::meta_bytes :
+                   type == GGML_TYPE_Q4_K    ? qskinny_codec<GGML_TYPE_Q4_K   >::meta_bytes :
+                   type == GGML_TYPE_Q5_K    ? qskinny_codec<GGML_TYPE_Q5_K   >::meta_bytes :
+                                               qskinny_codec<GGML_TYPE_Q6_K   >::meta_bytes;
+    // meta layout: [k/256][n/32][32][meta_bytes]
+    return (size_t) (k / 256) * n * mb;
+}
+
+// every type the out-of-place (side buffer) route supports
+bool ggml_cuda_q4k_skinny_side_supported(ggml_type type) {
+    return ggml_cuda_q4k_skinny_type_is_iq(type) ||
+           type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
+           type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+}
+
+// Mode selection for the k-quant family (env LLAMA_SM70_SKINNY):
+//   0 = off (stock paths), 1 = legacy in-place repack (skinny everywhere),
+//   2 = side-buffer repack (default): skinny for M > 64 (f16 expansion, the
+//       measured +10 % prefill) and the stock path for M <= 64 (the measured
+//       -8..-36 % decode of the in-place route is why).
+int ggml_cuda_skinny_mode() {
+    static const int mode = [] {
+        const char * e = getenv("LLAMA_SM70_SKINNY");
+        if (e == nullptr) {
+            return 2;
+        }
+        const int m = atoi(e);
+        return (m == 0 || m == 1) ? m : 2;
+    }();
+    return mode;
+}
+
 bool ggml_cuda_q4k_skinny_mul_mat_codes(ggml_type type, const uint8_t * codes, const half * input,
                                         float * output, int n, int k, int m, cudaStream_t stream) {
-    if (!ggml_cuda_q4k_skinny_type_is_iq(type)) {
+    if (!ggml_cuda_q4k_skinny_side_supported(type)) {
         return false;
     }
     return q4k_skinny_mul_mat_dispatch(type, codes, input, output, n, k, m, stream);
@@ -1928,6 +1985,11 @@ void ggml_cuda_q4k_skinny_to_f16_codes(ggml_type type, const uint8_t * codes, ha
                                        int n, int k, cudaStream_t stream) {
     const dim3 grid((unsigned) (k / 256), (unsigned) (n / 32), 1);
     switch (type) {
+        case GGML_TYPE_Q2_K:   qskinny_to_f16_kernel<GGML_TYPE_Q2_K  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
+        case GGML_TYPE_Q3_K:   qskinny_to_f16_kernel<GGML_TYPE_Q3_K  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
+        case GGML_TYPE_Q4_K:   qskinny_to_f16_kernel<GGML_TYPE_Q4_K  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
+        case GGML_TYPE_Q5_K:   qskinny_to_f16_kernel<GGML_TYPE_Q5_K  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
+        case GGML_TYPE_Q6_K:   qskinny_to_f16_kernel<GGML_TYPE_Q6_K  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
         case GGML_TYPE_IQ3_S:   qskinny_to_f16_kernel<GGML_TYPE_IQ3_S  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
         case GGML_TYPE_IQ3_XXS: qskinny_to_f16_kernel<GGML_TYPE_IQ3_XXS><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
         case GGML_TYPE_IQ2_XS:  qskinny_to_f16_kernel<GGML_TYPE_IQ2_XS ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
@@ -1941,6 +2003,11 @@ void ggml_cuda_q4k_skinny_repack_side(ggml_type type, const void * src, uint8_t 
                                       uint8_t * meta, int n, int k, cudaStream_t stream) {
     // the source tensor stays intact, so no staging copy is needed (unlike the in-place path)
     switch (type) {
+        case GGML_TYPE_Q2_K:   q4k_skinny_repack_tiles<GGML_TYPE_Q2_K  >(src, codes, meta, n, k, 0, n / 32, stream); break;
+        case GGML_TYPE_Q3_K:   q4k_skinny_repack_tiles<GGML_TYPE_Q3_K  >(src, codes, meta, n, k, 0, n / 32, stream); break;
+        case GGML_TYPE_Q4_K:   q4k_skinny_repack_tiles<GGML_TYPE_Q4_K  >(src, codes, meta, n, k, 0, n / 32, stream); break;
+        case GGML_TYPE_Q5_K:   q4k_skinny_repack_tiles<GGML_TYPE_Q5_K  >(src, codes, meta, n, k, 0, n / 32, stream); break;
+        case GGML_TYPE_Q6_K:   q4k_skinny_repack_tiles<GGML_TYPE_Q6_K  >(src, codes, meta, n, k, 0, n / 32, stream); break;
         case GGML_TYPE_IQ3_S:   q4k_skinny_repack_tiles<GGML_TYPE_IQ3_S  >(src, codes, meta, n, k, 0, n / 32, stream); break;
         case GGML_TYPE_IQ3_XXS: q4k_skinny_repack_tiles<GGML_TYPE_IQ3_XXS>(src, codes, meta, n, k, 0, n / 32, stream); break;
         case GGML_TYPE_IQ2_XS:  q4k_skinny_repack_tiles<GGML_TYPE_IQ2_XS >(src, codes, meta, n, k, 0, n / 32, stream); break;

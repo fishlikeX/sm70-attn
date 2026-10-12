@@ -9,6 +9,7 @@
 #include "q-skinny-common.cuh"
 #include "q8-skinny.cuh"
 #include "q4k-skinny.cuh"
+#include "iq-skinny.cuh"
 
 #include <algorithm>
 #include <vector>
@@ -1184,7 +1185,12 @@ void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     }
 
     for (ggml_tensor * t : candidates) {
-        ggml_cuda_q8_skinny_repack_inplace(ctx, t);
+        if (ggml_cuda_skinny_mode() == 2) {
+            // side buffer: original bytes survive, the decode falls back to the stock path
+            ggml_cuda_iq_skinny_repack(ctx, t);
+        } else {
+            ggml_cuda_q8_skinny_repack_inplace(ctx, t);
+        }
     }
 }
 

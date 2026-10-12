@@ -56,3 +56,7 @@ void ggml_cuda_q4k_skinny_to_f16_codes(ggml_type type, const uint8_t * codes, ha
 void ggml_cuda_q4k_skinny_repack_side(ggml_type type, const void * src, uint8_t * codes,
                                       uint8_t * meta, int n, int k, cudaStream_t stream);
 bool ggml_cuda_q4k_skinny_type_is_iq(ggml_type type);
+bool ggml_cuda_q4k_skinny_side_supported(ggml_type type);
+size_t ggml_cuda_skinny_codes_bytes(ggml_type type, int n, int k);
+size_t ggml_cuda_skinny_meta_bytes(ggml_type type, int n, int k);
+int  ggml_cuda_skinny_mode();

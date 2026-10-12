@@ -17,6 +17,7 @@
 #define IQ_SKINNY_LUT_DEFINE 1
 #include "iq-skinny.cuh"
 #include "convert.cuh"
+#include "q4k-skinny.cuh"
 
 #include <mutex>
 #include <memory>
@@ -50,22 +51,11 @@ std::vector<std::unique_ptr<iq_skinny_entry>> iq_skinny_storage; // keeps descri
 std::unordered_map<const ggml_tensor *, iq_skinny_entry *> iq_skinny_map;
 
 size_t iq_skinny_codes_bytes(ggml_type type, int n, int k) {
-    switch (type) {
-        case GGML_TYPE_IQ3_S:   return qskinny_codec<GGML_TYPE_IQ3_S  >::codes_bytes(n, k);
-        case GGML_TYPE_IQ3_XXS: return qskinny_codec<GGML_TYPE_IQ3_XXS>::codes_bytes(n, k);
-        case GGML_TYPE_IQ2_XS:  return qskinny_codec<GGML_TYPE_IQ2_XS >::codes_bytes(n, k);
-        case GGML_TYPE_IQ2_S:   return qskinny_codec<GGML_TYPE_IQ2_S  >::codes_bytes(n, k);
-        default:                GGML_ABORT("iq skinny: unknown type");
-    }
+    return ggml_cuda_skinny_codes_bytes(type, n, k);
 }
 
 size_t iq_skinny_meta_bytes(ggml_type type, int n, int k) {
-    const int mb = type == GGML_TYPE_IQ3_S   ? qskinny_codec<GGML_TYPE_IQ3_S  >::meta_bytes :
-                   type == GGML_TYPE_IQ3_XXS ? qskinny_codec<GGML_TYPE_IQ3_XXS>::meta_bytes :
-                   type == GGML_TYPE_IQ2_XS  ? qskinny_codec<GGML_TYPE_IQ2_XS >::meta_bytes :
-                                               qskinny_codec<GGML_TYPE_IQ2_S  >::meta_bytes;
-    // meta layout: [k/256][n/32][32][meta_bytes]
-    return (size_t) (k / 256) * n * mb;
+    return ggml_cuda_skinny_meta_bytes(type, n, k);
 }
 
 bool iq_skinny_enabled() {
@@ -91,7 +81,15 @@ const iq_skinny_entry * iq_skinny_get(const ggml_tensor * t) {
 } // namespace
 
 bool ggml_cuda_iq_skinny_can_repack(const ggml_tensor * t) {
-    if (!iq_skinny_enabled() || !ggml_cuda_q4k_skinny_type_is_iq(t->type)) {
+    if (!ggml_cuda_q4k_skinny_side_supported(t->type)) {
+        return false;
+    }
+    // route gate: IQ types follow LLAMA_SM70_IQ_SKINNY (opt-in, off by default),
+    // the k-quant types follow the k-quant mode (2 = side-buffer hybrid)
+    const bool enabled = ggml_cuda_q4k_skinny_type_is_iq(t->type)
+        ? (ggml_cuda_skinny_mode() != 0 && iq_skinny_enabled())
+        : (ggml_cuda_skinny_mode() == 2);
+    if (!enabled) {
         return false;
     }
     if (t->view_src != nullptr || t->op != GGML_OP_NONE || t->extra != nullptr) {
@@ -163,7 +161,9 @@ void ggml_cuda_iq_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     std::vector<ggml_tensor *> candidates;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && ggml_cuda_iq_skinny_can_repack(node->src[0])) {
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
+                ggml_cuda_q4k_skinny_type_is_iq(node->src[0]->type) &&
+                ggml_cuda_iq_skinny_can_repack(node->src[0])) {
             candidates.push_back(node->src[0]);
         }
     }
