@@ -69,9 +69,12 @@ size_t iq_skinny_meta_bytes(ggml_type type, int n, int k) {
 }
 
 bool iq_skinny_enabled() {
+    // default OFF: locked-clock A/B on the production box (2026-10-13, see the T2 report
+    // section 6.1) showed +1.9 % pp512 on one card and no change on two cards or on
+    // decode, against +7.3 % VRAM on the repacked tensors - not worth a default.
     static const bool enabled = [] {
         const char * e = getenv("LLAMA_SM70_IQ_SKINNY");
-        return e == nullptr || atoi(e) != 0;
+        return e != nullptr && atoi(e) != 0;
     }();
     return enabled;
 }
