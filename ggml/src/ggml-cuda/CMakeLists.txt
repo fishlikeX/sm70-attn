@@ -116,6 +116,9 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    # gdn-chunk-sm70.cu is compiled by the dedicated sm_70 OBJECT target below;
+    # drop it from the glob or the same TU would be compiled twice.
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/gdn-chunk-sm70.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -137,6 +140,33 @@ if (CUDAToolkit_FOUND)
     # "cute/..." / "cutlass/..." includes relative to the vendor root.
     if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
         target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
+    endif()
+
+    # SM70 (Volta) GDN chunked prefill (TileLang/FlashQLA based, ported from
+    # llama.cpp-v100 v100-1.1.1, MIT). Compiled for sm_70 only via a dedicated
+    # OBJECT target with --expt-relaxed-constexpr (CuTe/tl_templates require it
+    # and CUDA_FLAGS does not set it). Dispatch sites in gated_delta_net.cu
+    # guard calls with ggml_cuda_has_arch(GGML_CUDA_CC_VOLTA), so builds without
+    # sm_70 in CMAKE_CUDA_ARCHITECTURES simply drop the objects.
+    set(GGML_CUDA_GDN_CHUNK_ENABLE OFF)
+    foreach(ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if (ARCH MATCHES "^70(-real|-virtual)?$")
+            set(GGML_CUDA_GDN_CHUNK_ENABLE ON)
+        endif()
+    endforeach()
+
+    if (GGML_CUDA_GDN_CHUNK_ENABLE)
+        add_library(ggml-cuda-gdnchunk OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/gdn-chunk-sm70.cu")
+        target_link_libraries(ggml-cuda-gdnchunk PRIVATE ggml-base)
+        target_include_directories(ggml-cuda-gdnchunk PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.."
+            "${CMAKE_CURRENT_SOURCE_DIR}/gdn-chunk-sm70"
+            "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
+        target_compile_options(ggml-cuda-gdnchunk PRIVATE
+            "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda>")
+        set_target_properties(ggml-cuda-gdnchunk PROPERTIES CUDA_ARCHITECTURES "70" POSITION_INDEPENDENT_CODE ON)
+        target_link_libraries(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-gdnchunk>)
     endif()
 
 
