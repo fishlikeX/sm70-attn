@@ -940,6 +940,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
+    // zero row at the draft input width, stands in for target positions the draft never received
+    std::vector<float> zeros;
+    bool zeros_warned = false;
+
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
@@ -1025,6 +1029,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
 
+        zeros.assign((size_t) n_embd_enc, 0.0f);
+
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
 
@@ -1095,6 +1101,49 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
+    // The draft cache must stay positionally contiguous: the batch allocator rejects
+    // any batch that starts past seq_pos_max + 1, and an M-RoPE image leaves exactly
+    // such a hole (its rows are pinned to one position and are skipped below, while
+    // the prompt positions after it jump by the image's spatial extent). Stand in
+    // zero rows for the missing span, mirroring the mainline zero-substitution for
+    // multimodal inputs the draft cannot read.
+    // ref: https://github.com/fishlikeX/sm70-attn/issues/2
+    bool fill_holes(llama_seq_id seq_id, llama_pos pos_beg) {
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const llama_pos pos_last = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        if (pos_last < 0 || pos_beg <= pos_last + 1) {
+            return true;
+        }
+
+        if (!zeros_warned) {
+            LOG_WRN("%s: draft cache misses positions %d..%d (multimodal input) - filled with zero rows\n",
+                    __func__, (int) pos_last + 1, (int) pos_beg - 1);
+            zeros_warned = true;
+        }
+
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        for (llama_pos p = pos_last + 1; p < pos_beg; p += n_ubatch) {
+            const int32_t n_chunk = (int32_t) std::min<llama_pos>(n_ubatch, pos_beg - p);
+
+            batch_inject.clear();
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                const llama_pos q = p + i;
+                const llama_pos pos_arr[4] = { q, q, q, 0 };
+                batch_inject.add_embd({ zeros.data(), 1, zeros.size() }, pos_arr, seq_id, false);
+            }
+
+            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+            if (rc != 0) {
+                LOG_ERR("%s: failed to fill draft cache hole rc=%d (n_tokens=%d, pos=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) p);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
@@ -1137,8 +1186,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
-            // an M-RoPE image pins all its rows to one position, so a windowed draft
-            // cache cannot free cells for it - skip it, the draft can jump over the gap
+            // patch any span the draft never received before injecting this batch,
+            // otherwise the batch does not start right after the draft's last position
+            if (!fill_holes(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0])) {
+                return false;
+            }
+
+            // an M-RoPE image pins all its rows to one position - skip it, the draft can
+            // jump over the gap (the hole is filled with zeros by the next process() call)
             const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
             if (has_embeddings && n_rows > 1 && pos_pinned) {
                 continue;
@@ -1193,6 +1248,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
+                continue;
+            }
+
+            // a trailing image skips positions the noise block would start past - fill them
+            if (!fill_holes(seq_id, dp.pos0)) {
+                dp.drafting = false;
                 continue;
             }
 
