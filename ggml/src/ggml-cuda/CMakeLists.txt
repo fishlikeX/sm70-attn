@@ -165,6 +165,10 @@ if (CUDAToolkit_FOUND)
             "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
         target_compile_options(ggml-cuda-gdnchunk PRIVATE
             "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda>")
+        if (MSVC)  # same vendor-header fixes as the main ggml-cuda target (see below)
+            target_compile_options(ggml-cuda-gdnchunk PRIVATE
+                "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus -D_USE_MATH_DEFINES>")
+        endif()
         set_target_properties(ggml-cuda-gdnchunk PROPERTIES CUDA_ARCHITECTURES "70" POSITION_INDEPENDENT_CODE ON)
         target_link_libraries(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-gdnchunk>)
     endif()
@@ -294,6 +298,10 @@ if (CUDAToolkit_FOUND)
         # CCCL 3.2 onwards will require a cpp-standard-compliant preprocessor for MSVC
         # https://github.com/NVIDIA/cccl/pull/6827
         list(APPEND CUDA_CXX_FLAGS /Zc:preprocessor)
+        # Ported sm70-vendor CUTLASS / flash headers need a truthful __cplusplus under MSVC
+        # (nvcc defaults to 199714L via cl, silently disabling C++17 paths in vendor code)
+        # and math constants (M_LOG2E etc.) which MSVC hides unless _USE_MATH_DEFINES.
+        list(APPEND CUDA_CXX_FLAGS /Zc:__cplusplus -D_USE_MATH_DEFINES)
     endif()
 
     list(JOIN   CUDA_CXX_FLAGS " " CUDA_CXX_FLAGS_JOINED)  # pass host compiler flags as a single argument
