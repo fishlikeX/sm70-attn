@@ -1693,11 +1693,22 @@ bool ggml_cuda_q4k_skinny_is_repacked(const ggml_tensor * t) {
     return t->extra == (const void *) &q4k_skinny_marker;
 }
 
+bool ggml_cuda_skinny_env_disabled() {
+    static const bool disabled = [] {
+        const char * e = getenv("LLAMA_SM70_SKINNY");
+        return e != nullptr && e[0] == '0';
+    }();
+    return disabled;
+}
+
 bool ggml_cuda_q4k_skinny_can_repack(const ggml_tensor * t) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED(t);
     return false;
 #else
+    if (ggml_cuda_skinny_env_disabled()) {
+        return false;
+    }
     // the codec family serves Q2_K/Q3_K/Q4_K/Q5_K/Q6_K (see qskinny_codec) and all
     // five are repacked at runtime. Their compute moves from the MMVQ q8_1 path to F16, which
     // changes greedy tokens at ulp level; that is the intended cost of covering the mixed types.

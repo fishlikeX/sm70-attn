@@ -8,6 +8,7 @@
 #include "convert.cuh"
 #include "q-skinny-common.cuh"
 #include "q8-skinny.cuh"
+#include "q4k-skinny.cuh"
 
 #include <algorithm>
 #include <vector>
@@ -1042,6 +1043,9 @@ bool ggml_cuda_q8_skinny_can_repack(const ggml_tensor * t) {
     GGML_UNUSED(t);
     return false;
 #else
+    if (ggml_cuda_skinny_env_disabled()) {
+        return false;
+    }
     if (t->type != GGML_TYPE_Q8_0 || t->view_src != nullptr || t->op != GGML_OP_NONE || t->extra != nullptr) {
         return false;
     }

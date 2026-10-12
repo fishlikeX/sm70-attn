@@ -19,6 +19,8 @@
 // header, copied unchanged. A type keeps its byte count. A repacked tensor is tagged through
 // tensor->extra; reading it with ggml_backend_tensor_get() returns the repacked bytes, there
 // is no conversion back to the original layout.
+// A/B switch for the whole k-quant skinny family: LLAMA_SM70_SKINNY=0 disables
+bool ggml_cuda_skinny_env_disabled();
 bool ggml_cuda_q4k_skinny_can_repack(const ggml_tensor * t);
 bool ggml_cuda_q4k_skinny_is_repacked(const ggml_tensor * t);
 
