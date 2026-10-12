@@ -1960,6 +1960,19 @@ static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const 
 }
 
 static void ggml_cuda_mul_mat_iq_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Hybrid policy (measured 2026-10-13): the M>64 expansion path is much faster than
+    // the stock mmq/DP4A path (single-V100 pp512 938.8 vs 653.8 t/s with design B) while
+    // the small-M skinny kernels do not beat mmq for the IQ types (tg128 24.5-29.8 vs
+    // 29.8 t/s). So: M > 64 takes the expansion, M <= 64 stays on the stock path with
+    // the ORIGINAL tensor bytes (out-of-place repack keeps them intact).
+    const int64_t m = src1->ne[1];
+    if (m <= 64) {
+        ggml_tensor src0_tmp = *src0;
+        src0_tmp.extra = nullptr; // route around the slim wrapper; data is the original tensor
+        ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
+        return;
+    }
+
     if (ggml_cuda_iq_skinny_mul_mat(ctx, src0, src1, dst)) {
         return;
     }

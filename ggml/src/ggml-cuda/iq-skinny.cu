@@ -14,6 +14,7 @@
 // Enable/disable: env LLAMA_SM70_IQ_SKINNY=0 disables (A/B benchmarking); default on.
 // Volta only, like the rest of the skinny family.
 
+#define IQ_SKINNY_LUT_DEFINE 1
 #include "iq-skinny.cuh"
 #include "convert.cuh"
 
@@ -121,6 +122,15 @@ void ggml_cuda_iq_skinny_repack(ggml_backend_cuda_context & ctx, ggml_tensor * t
     const int k = (int) t->ne[0];
     const size_t codes_bytes = iq_skinny_codes_bytes(t->type, n, k);
     const size_t meta_bytes  = iq_skinny_meta_bytes(t->type, n, k);
+
+    // design-B decodes read the f16 grid / sign-mask LUTs; build them once per process
+    {
+        static bool lut_ready = false;
+        if (!lut_ready) {
+            iq_skinny_init_lut(ctx.stream());
+            lut_ready = true;
+        }
+    }
 
     auto entry = std::make_unique<iq_skinny_entry>();
     entry->type = t->type;

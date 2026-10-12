@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <vector>
 
+#include #define IQ_SKINNY_LUT_DEFINE 1
 #include "iq-skinny.cuh"
 #include "ggml-quants.h"
 #include "gguf.h"
@@ -210,6 +211,7 @@ static int run_check(int kind, const uint8_t * raw, size_t n_blocks) {
         }
     };
 
+    iq_skinny_init_lut(0); // design-B LUTs (no-op for design-A types)
     repack();
     decode();
     TEST_CUDA_CHECK(cudaDeviceSynchronize());

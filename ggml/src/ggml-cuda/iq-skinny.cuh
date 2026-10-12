@@ -1,19 +1,22 @@
-// IQ skinny record codecs (design A) for sm_70 (Volta) - T2 of the v100 port line.
+// IQ skinny record codecs (T2 of the v100 port line).
 //
-// Design A bakes the grid lookup into the repacked record at load time: a fixed-width
-// code per value (magnitude index + sign) at the QPN8 slot offsets the k-quant codecs
-// use, so the GPU decode needs no table - it builds the f16 magnitude arithmetically
-// and folds the sign in with an XOR. Per type:
+// TWO DESIGNS, per the 2026-10-13 decision ("A first, B as the fallback"): design A
+// bakes the iq3s_grid lookup into the record at repack time (no table in the kernel,
+// ~4-5 ops/value to rebuild the magnitude); design B keeps the grid index + expanded
+// sign bits in the record and decodes through a one-time built f16 grid table in L1
+// (~1.5 ops/value). The measured A/B on this tree led to B for IQ3_S:
 //
-//   IQ3_S   : 4-bit code (3-bit index into {1,3,...,15}), record 8 B,  meta 6 B  (d + scales[4])
-//   IQ3_XXS : 4-bit code (3-bit index into {4,12,...,62}), record 8 B,  meta 6 B  (d + 8 nibbles)
-//   IQ2_XS  : 3-bit code (2-bit index into {8,25,43}),     record 6 B,  meta 10 B (d + scales[8])
-//   IQ2_S   : 3-bit code (2-bit index into {8,25,43}),     record 6 B,  meta 10 B (d + scales[8])
+//   design A (commit 331612208): single-V100 tg128 29.81 vs mmq 29.79 t/s - neutral,
+//   the ~4-5 op/value decode keeps the M1 kernel at the mmq issue rate.
+//   design B (this file): record keeps 4x9-bit grid indices + 16 sign bits = 52 bits
+//   in 7 bytes; decode = 1 LUT load + 1 sign-mask load + 1 XOR + 1 half2 mul per
+//   4 values, i.e. ~1.5 ops/value, and drops the on-disk growth to +7.3 %.
 //
-// Block cost: IQ3_S 134 B vs 110 on disk (+21.8 %), IQ3_XXS 134 vs 98 (+36.7 %),
-// IQ2_XS 106 vs 74 (+43.2 %), IQ2_S 106 vs 82 (+29.3 %) per 256-value super-block.
-// None of the four is byte-neutral, so unlike the k-quant codecs the repack is
-// out-of-place by construction (side buffer first, load-time CPU repack later).
+// Per type (design B where noted, design A otherwise):
+//   IQ3_S   (B): record 7 B = 4x9-bit idx + 16 sign bits, meta 6 B   -> 118 B/block (+7.3 %)
+//   IQ3_XXS (A): 4-bit codes (3-bit index into {4,12,...,62}), record 8 B, meta 6 B -> +36.7 %
+//   IQ2_XS  (A): 3-bit codes (2-bit index into {8,25,43}),     record 6 B, meta 10 B -> +43.2 %
+//   IQ2_S   (A): 3-bit codes (2-bit index into {8,25,43}),     record 6 B, meta 10 B -> +29.3 %
 //
 // Value semantics validated against the in-tree dequantize_row_iq*:
 //   host   : tests/sm70-iq-host-check/iq_host_check.cpp (18.9M+ real values, 100% <=1 ulp)
@@ -27,36 +30,57 @@
 #include "common.cuh"
 #include "q-skinny-common.cuh"
 
-// ---- shared record helpers (shared by the four IQ codecs) ----
+// ---- one-time LUTs for design B (built by iq_skinny_init_lut, 4 KB + 128 B) ----
 
-// 32 values of one sub-block from its 2 records in original order -> 16 half2.
-// scale_of(r) gives the f16 scale of record r (per-record for the IQ2 family,
-// the same scale for both records in the IQ3 family).
-template <int kBits, typename DecodeT>
-static __device__ __forceinline__ void iq_skinny_decode_32(
-        const qskinny_code records[2], const half scale_of[2], half2 out[16]) {
-    half2 scale2[2] = { __halves2half2(scale_of[0], scale_of[0]),
-                        __halves2half2(scale_of[1], scale_of[1]) };
+// iq3s_grid entry (4 byte values in {1,3,...,15}) pre-converted to 4 f16 halves;
+// 4-bit sign pattern -> four f16 sign bits. Defined once (iq-skinny.cu sets
+// IQ_SKINNY_LUT_DEFINE before including this header; standalone device tests may
+// define their own copy), extern everywhere else.
+#if defined(IQ_SKINNY_LUT_DEFINE)
+__device__ unsigned long long iq3s_grid_f16[512];
+__device__ unsigned long long iq3s_sign_mask16[16];
+
+__global__ void iq_skinny_init_lut_kernel() {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 512) {
+        const uint8_t * g = (const uint8_t *) (iq3s_grid + i);
+        unsigned long long v = 0;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        const int r = i >> 3;              // values 0..15 -> record 0, 16..31 -> record 1
-        const int j = 2 * (i & 7);
-        const unsigned c0 = (unsigned) qskinny_code_get(records[r], kBits * qpn8_physical_k(j + 0), kBits);
-        const unsigned c1 = (unsigned) qskinny_code_get(records[r], kBits * qpn8_physical_k(j + 1), kBits);
-        out[i] = __hmul2(__halves2half2(DecodeT::value(c0), DecodeT::value(c1)), scale2[r]);
+        for (int j = 0; j < 4; ++j) {
+            v |= (unsigned long long) __half_as_ushort(__int2half_rn((int) g[j])) << (16 * j);
+        }
+        iq3s_grid_f16[i] = v;
+    }
+    if (i < 16) {
+        unsigned long long m = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            m |= (unsigned long long) (((i >> j) & 1) << 15) << (16 * j);
+        }
+        iq3s_sign_mask16[i] = m;
     }
 }
+#else
+extern __device__ unsigned long long iq3s_grid_f16[512];
+extern __device__ unsigned long long iq3s_sign_mask16[16];
+__global__ void iq_skinny_init_lut_kernel();
+#endif
 
-// ============================================================================ IQ3_S
+// must run once per process before any design-B decode
+inline void iq_skinny_init_lut(cudaStream_t stream) {
+    iq_skinny_init_lut_kernel<<<2, 256, 0, stream>>>();
+}
+
+// ============================================================================ IQ3_S (design B)
 
 template <> struct qskinny_codec<GGML_TYPE_IQ3_S> {
-    using record_t = uint64_t; // 16 values * 4 bit fills the low word exactly; hi stays 0
+    using record_t = qskinny_rec7; // 4x9-bit grid index + 16 sign bits = 52 bits in 7 bytes
     struct meta_t {
         unsigned long long w; // d (f16, 2 bytes) + scales[4], little-endian
     };
-    static constexpr int record_bytes      = 8;
+    static constexpr int record_bytes      = 7;
     static constexpr int meta_bytes        = 6;
-    static constexpr int bits_per_value    = 4;
+    static constexpr int bits_per_value    = 0; // design B stores indices, not per-value codes
     static constexpr int block_bytes       = sizeof(block_iq3_s);
     static constexpr int values_per_record = 16;
     static constexpr int values_per_meta   = 256;
@@ -69,7 +93,9 @@ template <> struct qskinny_codec<GGML_TYPE_IQ3_S> {
         return n * k * record_bytes / values_per_record;
     }
     static __device__ __forceinline__ qskinny_code load_record(const record_t * p) {
-        return { *p, 0 };
+        unsigned long long v = 0;
+        memcpy(&v, p->b, record_bytes);
+        return { v, 0 };
     }
     static __device__ __forceinline__ meta_t load_meta(const uint8_t * p) {
         meta_t m;
@@ -89,62 +115,65 @@ template <> struct qskinny_codec<GGML_TYPE_IQ3_S> {
         memcpy(((uint8_t *) &m.w) + 2, block + 106, 4);
         return m;
     }
-    static __device__ __forceinline__ void value_at(const uint8_t * block, const int p, unsigned & mag, unsigned & sign) {
-        const uint8_t * qs    = block + 2;
-        const uint8_t * qh    = block + 2 + 64;
-        const uint8_t * signs = block + 2 + 64 + 8;
-        const int sb = p / 32;
-        const int l  = (p % 32) / 8;
-        const int j  = p % 8;
-        const uint8_t * qs_sb = qs + 8 * sb;
-        const uint8_t   qh_sb = qh[sb];
-        const uint8_t * sg_sb = signs + 4 * sb;
-        const uint8_t * grid;
-        if (j < 4) {
-            grid = (const uint8_t *) (iq3s_grid + (qs_sb[2*l + 0] | (((unsigned) qh_sb << (8 - 2*l)) & 256)));
-        } else {
-            grid = (const uint8_t *) (iq3s_grid + (qs_sb[2*l + 1] | (((unsigned) qh_sb << (7 - 2*l)) & 256)));
-        }
-        mag  = grid[j & 3];
-        sign = (sg_sb[l] >> j) & 1;
-    }
-    // odd magnitudes: index = (mag - 1) / 2
-    static __device__ __forceinline__ unsigned mag_of(const unsigned idx) {
-        return 2 * idx + 1;
-    }
-    static __device__ __forceinline__ unsigned idx_of(const unsigned mag) {
-        return (mag - 1) / 2;
-    }
+    // record layout: [0,9) [9,18) grid indices of group l (sub-block g>>1, half g&1),
+    //                [18,27) [27,36) grid indices of group l+1,
+    //                [36,44) [44,52) their sign bytes
     static __device__ __forceinline__ qskinny_code pack_record(const uint8_t * block, const int g) {
-        qskinny_code rec = { 0, 0 };
-        const int p0 = 32 * (g >> 1) + 16 * (g & 1);
+        const int sb = g >> 1;
+        const int h  = g & 1;
+        const uint8_t * qs  = block + 2 + 8 * sb;
+        const uint8_t   qh  = block[2 + 64 + sb];
+        const uint8_t * sg  = block + 2 + 64 + 8 + 4 * sb;
+        unsigned long long rec = 0;
+        int bit = 0;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            unsigned mag, sign;
-            value_at(block, p0 + j, mag, sign);
-            qskinny_code_put(rec, idx_of(mag) | (sign << 3), bits_per_value * qpn8_physical_k(j), bits_per_value);
+        for (int l = 2 * h; l <= 2 * h + 1; ++l) {
+            const unsigned i0 = qs[2*l + 0] | (((unsigned) qh << (8 - 2*l)) & 256);
+            const unsigned i1 = qs[2*l + 1] | (((unsigned) qh << (7 - 2*l)) & 256);
+            rec |= (unsigned long long) i0 << bit; bit += 9;
+            rec |= (unsigned long long) i1 << bit; bit += 9;
         }
-        return rec;
+        rec |= (unsigned long long) sg[2*h + 0] << 36;
+        rec |= (unsigned long long) sg[2*h + 1] << 44;
+        return { rec, 0 };
     }
+    // per-sub-block scale as one half: mirrors d * (1 + 2*s) of dequantize_row_iq3_s
     static __device__ __forceinline__ half scale_half(const meta_t m, const int sub_block) {
-        const uint8_t * sc = ((const uint8_t *) &m) + 2;
+        const uint8_t * sc = ((const uint8_t *) &m.w) + 2;
         const unsigned s = (sc[sub_block / 2] >> (4 * (sub_block % 2))) & 0xf;
-        const float d = __half2float(*(const half *) &m);
+        const float d = __half2float(*(const half *) &m.w);
         return __float2half_rn(d * (float) (1 + 2 * (int) s));
     }
+    // 32 values of one sub-block (records 2*sb, 2*sb+1) in original order -> 16 half2;
+    // the scale is folded in with one rounded half multiply (k-quant codec paradigm)
     static __device__ __forceinline__ void decode(
             const qskinny_code records[2], const meta_t m, const int sub_block, half2 out[16]) {
         const half sc = scale_half(m, sub_block);
-        const half scale2[2] = { sc, sc };
-        struct dec { static __device__ __forceinline__ half value(unsigned code) {
-            const half h = __int2half_rn((int) (2 * (code & 7) + 1));
-            return __ushort_as_half((unsigned short) (__half_as_ushort(h) ^ (unsigned short) (((code >> 3) & 1) << 15)));
-        } };
-        iq_skinny_decode_32<4, dec>(records, scale2, out);
+        const half2 scale2 = __halves2half2(sc, sc);
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const unsigned long long rec = records[r].lo;
+#pragma unroll
+            for (int grp = 0; grp < 2; ++grp) {
+                const unsigned i0 = (unsigned) ((rec >> (18 * grp + 0)) & 511);
+                const unsigned i1 = (unsigned) ((rec >> (18 * grp + 9)) & 511);
+                const unsigned sg = (unsigned) ((rec >> (36 + 8 * grp)) & 0xff);
+                const unsigned long long w0 = iq3s_grid_f16[i0] ^ iq3s_sign_mask16[sg & 0xf];
+                const unsigned long long w1 = iq3s_grid_f16[i1] ^ iq3s_sign_mask16[sg >> 4];
+                const unsigned long long ws[2] = { w0, w1 };
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const unsigned short * hp = (const unsigned short *) &ws[t >> 1];
+                    const half2 pair = __halves2half2(__ushort_as_half(hp[(t & 1) * 2 + 0]),
+                                                      __ushort_as_half(hp[(t & 1) * 2 + 1]));
+                    out[8 * r + 4 * grp + t] = __hmul2(pair, scale2);
+                }
+            }
+        }
     }
 };
 
-// ============================================================================ IQ3_XXS
+// ============================================================================ IQ3_XXS (design A)
 
 // magnitudes {4,12,20,28,36,44,52,62}: 4 + 8*idx for idx < 7, 62 for idx == 7
 static __device__ __forceinline__ unsigned iq3xxs_mag_of(const unsigned idx) {
@@ -231,24 +260,31 @@ template <> struct qskinny_codec<GGML_TYPE_IQ3_XXS> {
         return rec;
     }
     static __device__ __forceinline__ half scale_half(const meta_t m, const int sub_block) {
-        const uint8_t * sc = ((const uint8_t *) &m) + 2;
+        const uint8_t * sc = ((const uint8_t *) &m.w) + 2;
         const unsigned s = (sc[sub_block / 2] >> (4 * (sub_block % 2))) & 0xf;
-        const float d = __half2float(*(const half *) &m);
+        const float d = __half2float(*(const half *) &m.w);
         return __float2half_rn(d * (0.5f + (float) (int) s) * 0.5f);
     }
     static __device__ __forceinline__ void decode(
             const qskinny_code records[2], const meta_t m, const int sub_block, half2 out[16]) {
         const half sc = scale_half(m, sub_block);
-        const half scale2[2] = { sc, sc };
+        const half2 scale2 = __halves2half2(sc, sc);
         struct dec { static __device__ __forceinline__ half value(unsigned code) {
             const half h = __int2half_rn((int) iq3xxs_mag_of(code & 7));
             return __ushort_as_half((unsigned short) (__half_as_ushort(h) ^ (unsigned short) (((code >> 3) & 1) << 15)));
         } };
-        iq_skinny_decode_32<4, dec>(records, scale2, out);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int r = i >> 3;
+            const int j = 2 * (i & 7);
+            const unsigned c0 = (unsigned) qskinny_code_get(records[r], 4 * qpn8_physical_k(j + 0), 4);
+            const unsigned c1 = (unsigned) qskinny_code_get(records[r], 4 * qpn8_physical_k(j + 1), 4);
+            out[i] = __hmul2(__halves2half2(dec::value(c0), dec::value(c1)), scale2);
+        }
     }
 };
 
-// ============================================================================ IQ2_XS / IQ2_S
+// ============================================================================ IQ2_XS / IQ2_S (design A)
 
 // magnitudes {8,25,43}
 static __device__ __forceinline__ unsigned iq2_mag_of(const unsigned idx) {
@@ -339,7 +375,14 @@ template <> struct qskinny_codec<GGML_TYPE_IQ2_XS> {
             const half h = __int2half_rn((int) iq2_mag_of(code & 3));
             return __ushort_as_half((unsigned short) (__half_as_ushort(h) ^ (unsigned short) (((code >> 2) & 1) << 15)));
         } };
-        iq_skinny_decode_32<3, dec>(records, scale2, out);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int r = i >> 3;
+            const int j = 2 * (i & 7);
+            const unsigned c0 = (unsigned) qskinny_code_get(records[r], 3 * qpn8_physical_k(j + 0), 3);
+            const unsigned c1 = (unsigned) qskinny_code_get(records[r], 3 * qpn8_physical_k(j + 1), 3);
+            out[i] = __hmul2(__halves2half2(dec::value(c0), dec::value(c1)), __halves2half2(scale2[r], scale2[r]));
+        }
     }
 };
 
@@ -424,7 +467,14 @@ template <> struct qskinny_codec<GGML_TYPE_IQ2_S> {
             const half h = __int2half_rn((int) iq2_mag_of(code & 3));
             return __ushort_as_half((unsigned short) (__half_as_ushort(h) ^ (unsigned short) (((code >> 2) & 1) << 15)));
         } };
-        iq_skinny_decode_32<3, dec>(records, scale2, out);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int r = i >> 3;
+            const int j = 2 * (i & 7);
+            const unsigned c0 = (unsigned) qskinny_code_get(records[r], 3 * qpn8_physical_k(j + 0), 3);
+            const unsigned c1 = (unsigned) qskinny_code_get(records[r], 3 * qpn8_physical_k(j + 1), 3);
+            out[i] = __hmul2(__halves2half2(dec::value(c0), dec::value(c1)), __halves2half2(scale2[r], scale2[r]));
+        }
     }
 };
 

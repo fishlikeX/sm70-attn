@@ -35,6 +35,7 @@ struct qskinny_code {
 
 // record buffers of the sizes that have no matching builtin load type
 struct qskinny_rec6  { uint8_t b[6];  };
+struct qskinny_rec7  { uint8_t b[7];  };
 struct qskinny_rec10 { uint8_t b[10]; };
 struct qskinny_rec12 { uint8_t b[12]; };
 
