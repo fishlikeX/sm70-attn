@@ -1,6 +1,7 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 #include "gdn-chunk-sm70.cuh"
+#include <cstdlib>
 
 template <int S_v, bool KDA, bool keep_rs_t, bool Prologue>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -251,6 +252,18 @@ static void launch_gated_delta_net(
     }
 }
 
+// A/B switch for the sm_70 chunked-prefill path of GATED_DELTA_NET.
+// Default ON (preserves current behavior); set LLAMA_SM70_GDN_CHUNK=0 to route
+// the leading tokens through the stock recurrent kernel instead. Used to measure
+// the chunked prefill kernels' real contribution under locked clocks.
+static bool sm70_gdn_chunk_disabled() {
+    static const bool disabled = [] {
+        const char * e = getenv("LLAMA_SM70_GDN_CHUNK");
+        return e && e[0] == '0';
+    }();
+    return disabled;
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache,
         const ggml_cuda_gdn_prologue * prologue) {
@@ -342,7 +355,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     if constexpr (GGML_CUDA_GDN_CHUNK_SM70_COMPILED) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        const int64_t n_c = ggml_cuda_gdn_chunk_sm70_n_tokens(cc, S_v, H, neqk1, n_tokens, n_seqs, rq3, kda, K);
+        int64_t n_c = ggml_cuda_gdn_chunk_sm70_n_tokens(cc, S_v, H, neqk1, n_tokens, n_seqs, rq3, kda, K);
+        if (sm70_gdn_chunk_disabled()) {
+            n_c = 0;  // A/B: fall back to the stock recurrent path over the whole span
+        }
         if (n_c > 0) {
             h_mid.alloc(ctx.pool(), H * S_v * S_v);
 
