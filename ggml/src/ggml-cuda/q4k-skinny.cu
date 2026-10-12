@@ -1965,7 +1965,12 @@ int ggml_cuda_skinny_mode() {
     static const int mode = [] {
         const char * e = getenv("LLAMA_SM70_SKINNY");
         if (e == nullptr) {
-            return 2;
+            // default 0: locked-clock A/B on the production box (see the port reports)
+            // - mode 1: +10% pp512 but -28% tg128; mode 2: +9% pp / full decode but a
+            // full second copy of the quantized weights in VRAM (byte-neutral records)
+            // and +-0% at 65K, where attention dominates the prefill. Neither trade
+            // suits the 256K decode-heavy production profile, so the stock paths win.
+            return 0;
         }
         const int m = atoi(e);
         return (m == 0 || m == 1) ? m : 2;
