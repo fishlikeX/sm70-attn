@@ -1126,7 +1126,8 @@ void sm70_d256_splitkv3_merge_kernel(
         merge[0] = scale0;
         merge[1] = scale1;
         merge[2] = scale2;
-        merge[3] = 1.0f / denominator;
+        // Fully masked rows have denominator 0; llama.cpp expects 0 there.
+        merge[3] = denominator > 0.0f ? 1.0f / denominator : 0.0f;
     }
     __syncthreads();
 
