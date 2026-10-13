@@ -1046,6 +1046,24 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         }
     }
 
+    // A leaf can grow without being referenced as any node's src (e.g. a
+    // user-provided input whose buffer size changes between calls). The
+    // per-node loop above only visits nodes and their src slots, so such a
+    // leaf's recorded size_max is never re-checked. Compare each leaf's size
+    // explicitly so a larger input forces a re-layout instead of silently
+    // overwriting adjacent memory in the reused buffer.
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        struct leaf_alloc * leaf_alloc = &galloc->leaf_allocs[i];
+
+        if (!ggml_gallocr_node_needs_realloc(galloc, leaf, &leaf_alloc->leaf)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: leaf %s is not valid\n", __func__, leaf->name);
+#endif
+            return true;
+        }
+    }
+
     return false;
 }
 
