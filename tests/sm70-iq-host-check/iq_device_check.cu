@@ -21,7 +21,7 @@
 #include <algorithm>
 #include <vector>
 
-#include #define IQ_SKINNY_LUT_DEFINE 1
+#define IQ_SKINNY_LUT_DEFINE 1
 #include "iq-skinny.cuh"
 #include "ggml-quants.h"
 #include "gguf.h"
