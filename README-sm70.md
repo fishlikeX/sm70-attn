@@ -39,6 +39,10 @@ kernel into llama.cpp master and builds the following on top of it:
   (per-layer rounding halved);
 - **In-kernel q4_0 direct loads** (opt-in): XQA-style per-dtype template loads,
   saves ~470MB VRAM;
+- **In-kernel q8_0 direct loads** (default on, 10/22): same template
+  architecture for q8_0 K/V — the staged f16 mirror of a full q8 cache OOMs a
+  32GB card at ~160k ctx; direct vs staged output verified byte-identical
+  (greedy A/B, dense + SplitKV3);
 - **mtmd + dflash fix**: multimodal image + speculative decode crash on the
   M-RoPE position scale (upstream ggml-org#27408), fixed end-to-end.
 
@@ -130,6 +134,7 @@ checkpoints list. The reload count is also capped by `--ctx-checkpoints`
 | `LLAMA_SM70_D256` | `1` | Master switch; `0` disables the plugin (bit-identical to stock) |
 | `LLAMA_SM70_SPLITKV3_MIN_KV` | `2048` | SplitKV3 activation threshold (kv_len); `0` disables it entirely |
 | `LLAMA_SM70_D256_Q4_DIRECT` | `0` | In-kernel q4_0 direct loads: ~470MB VRAM saved, ~4% prefill slower |
+| `LLAMA_SM70_D256_Q8_DIRECT` | `1` | In-kernel q8_0 direct loads (10/22); `0` forces the staged f16 mirror (small-ctx A/B only — OOMs at production ctx) |
 | `LLAMA_SM70_D256_DEBUG` | `0` | Print kernel selection probes (ACCEPT/REJECT + reason) |
 | `SM70_DUMP` / `SM70_DUMP_KV` | off | Capture kernel inputs/outputs for offline repro & three-way blame |
 
