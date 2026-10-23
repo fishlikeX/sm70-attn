@@ -1,6 +1,21 @@
 # SM70 D256 Tensor-Core Decode Attention — 移植设计（WP1）
 
-状态：设计定稿，未实现。2026-10-24，基于 catch-up 合并 dad8a31208 之后的树。
+状态：**P1 已落地并通过正确性门禁（2026-10-24）**。P2（q4-direct）待做。
+
+## P1 实测记录（V100-SXM2-32GB, WSL2, Q4_K_XL + q4_0 K + f16 V）
+
+- 独立测试器 verify/sm70_dec_verify.cu（run_dec.sh）：9 case 全绿
+  （w=1/2/8、splits 1..24、live<<容量 mask 语义、GQA 6/8；max|err| ≤ 1.1e-3）。
+- logit A/B（贪心 128 tok）：零分叉（~6k 与 174,479 token 深上下文双档）。
+- 性能（诚实记录，P1 为正确性/管线里程碑，非性能版）：
+  ~6k ctx tg：stock 27.45 → tc 25.56（-7%）；174k ctx tg：10.07 → 9.39（-6.8%）。
+  原因：P1 走 f16 K 镜像（174k 时每步 358MB 额外写+读），stock vec 直读 q4 K。
+  P2 的 q4-direct 内核直读（复用 prefill 的 sm70_q4_fill_kv）即为消除此差额。
+- 调试档案（5 个根因，逐个验证后修复）：PV f16 累加器布局（row=lane 连续 8 维，
+  非 QK D-tile 映射）；partial split 平面跨度（跨全部 kv head 的全局行数）；
+  merge rescale 漏乘 Log2E（exp2 域）；decode mask 满容量、活长度在 -inf 边界
+  内容里（设备端扫描，顺带 CUDA-Graph 静态网格）；dst 维度序与 Q 相反
+  （实测 (D,heads,q_len)），merge 步长按 ne 值内省推导。
 
 ## 1. 动机
 
