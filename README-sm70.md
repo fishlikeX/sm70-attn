@@ -40,8 +40,7 @@ kernel into llama.cpp master and builds the following on top of it:
 - **In-kernel q4_0 direct loads** (opt-in): XQA-style per-dtype template loads,
   saves ~470MB VRAM;
 - **In-kernel q8_0 direct loads** (default on, 10/22): same template
-  architecture for q8_0 K/V — the staged f16 mirror of a full q8 cache OOMs a
-  32GB card at ~160k ctx; direct vs staged output verified byte-identical
+  architecture for q8_0 K/V — direct vs staged output verified byte-identical
   (greedy A/B, dense + SplitKV3);
 - **mtmd + dflash fix**: multimodal image + speculative decode crash on the
   M-RoPE position scale (upstream ggml-org#27408), fixed end-to-end.
