@@ -41,6 +41,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-sm70-d256-kernel.cuh"
+#include "fattn-sm70-d256-decode.cuh"
 #include <cstdio>
 #include <vector>
 
@@ -291,6 +292,141 @@ static void sm70_d256_probe(const char * reason, int cc,
             mask ? (long long) mask->ne[0] : -1LL, (const void *) mask);
 }
 
+// ---- decode (WP1-P1) env + split policy ------------------------------------
+// Default OFF until the verify battery + logit A/B gates pass on this port.
+static bool sm70_d256_decode_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SM70_D256_DECODE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+// Split cap from the CTA budget: aim hkv*splits ~<= 96 CTAs (V100 has 80 SMs;
+// decode is latency-bound, a modest second wave hides tail imbalance), hard
+// cap 32. The allocator sizes partials at this cap; the launcher may use less.
+static int sm70_d256_dec_split_cap(int hkv) {
+    return std::min(32, std::max(1, 96 / std::max(hkv, 1)));
+}
+static int sm70_d256_dec_splits(int kv_len, int hkv) {
+    const int s = std::min((kv_len + 511) / 512, sm70_d256_dec_split_cap(hkv));
+    return std::max(s, 1);
+}
+
+// Decode launch: TC kernel + f32 N-split merge (WP1-P1). Q read f32 straight
+// from the op input; K/V served f16 (native or dequant mirror — q4-direct is
+// P2); partials carved from the dst extra region exactly as alloc_size did.
+static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    GGML_ASSERT(mask != nullptr);
+    GGML_ASSERT(Q->ne[3] == 1);
+    GGML_ASSERT(K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0);
+
+    const int hkv    = (int) K->ne[2];
+    const int gqa    = (int) (Q->ne[2] / K->ne[2]);
+    const int q_len  = (int) Q->ne[1];
+    const int kv_len = (int) mask->ne[0];
+    const int heads_q = hkv * gqa;
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    GGML_ASSERT(logit_softcap == 0.0f);
+
+    cudaStream_t stream = ctx.stream();
+    const char * base = (const char *) dst->data + ggml_nbytes(dst);
+
+    // f16 mirrors (decode never uses q4-direct in P1).
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst,
+            K->type != GGML_TYPE_F16,
+            !(V_is_K_view && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16);
+    sm70_d256_dequant_kv((ggml_tensor *) K, (ggml_tensor *) V, f16_extra,
+                         V_is_K_view, stream, /*k_direct=*/false, /*v_direct=*/false);
+
+    const half * K_h2; const half * V_h2;
+    int64_t k_row, k_head, v_row, v_head;
+    if (K->type == GGML_TYPE_F16) {
+        K_h2 = (const half *) K->data; k_row = K->nb[1] / sizeof(half); k_head = K->nb[2] / sizeof(half);
+    } else {
+        K_h2 = (const half *) f16_extra.K; k_row = (int64_t) K->ne[2] * K->ne[0]; k_head = K->ne[0];
+    }
+    if (V_is_K_view) {
+        V_h2 = K_h2; v_row = k_row; v_head = k_head;
+    } else if (V->type == GGML_TYPE_F16) {
+        V_h2 = (const half *) V->data; v_row = V->nb[1] / sizeof(half); v_head = V->nb[2] / sizeof(half);
+    } else {
+        V_h2 = (const half *) f16_extra.V; v_row = (int64_t) V->ne[2] * V->ne[0]; v_head = V->ne[0];
+    }
+
+    const size_t f16_bytes = GGML_PAD((size_t) (f16_extra.end - (uintptr_t) base), 128);
+    const int splits      = sm70_d256_dec_splits(kv_len, hkv);
+    const int rows_total  = (int) (hkv * gqa * q_len);
+    float * partial_acc = (float *) (base + f16_bytes);
+    float * partial_m   = partial_acc + (int64_t) splits * rows_total * SM70_D256_D;
+    float * partial_l   = partial_m + (int64_t) splits * rows_total;
+
+    const dim3 grid(hkv, splits);
+    const int64_t q_row = Q->nb[1] / sizeof(float);
+    const int64_t q_head = Q->nb[2] / sizeof(float);
+    // mask (n_kv, q_len) f16: the last query row spans every live key.
+    const half * mask_last_q = (const half *) mask->data + (int64_t) (q_len - 1) * mask->ne[0];
+    const int64_t mask_q_stride = 1;   // k contiguous within a query row
+    if (gqa == 6) {
+        sm70_d256_decode::sm70_d256_decode_kernel<6><<<grid, 128, 0, stream>>>(
+            (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
+            q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l);
+    } else {
+        sm70_d256_decode::sm70_d256_decode_kernel<8><<<grid, 128, 0, stream>>>(
+            (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
+            q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    {
+        static bool once = [] { return getenv("LLAMA_SM70_D256_DEBUG") != nullptr; }();
+        if (once) {
+            once = false;
+            
+            fprintf(stderr, "[sm70-d256-dec dbg] Q ne=(%lld,%lld,%lld,%lld) type=%d nb=(%llu,%llu,%llu,%llu) | K ne=(%lld,%lld,%lld,%lld) | dst ne=(%lld,%lld,%lld,%lld)\n",
+                (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3], (int) Q->type,
+                (unsigned long long) Q->nb[0], (unsigned long long) Q->nb[1], (unsigned long long) Q->nb[2], (unsigned long long) Q->nb[3],
+                (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
+                (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3]);
+            fprintf(stderr, "[sm70-d256-dec dbg] mask type=%d ne=(%lld,%lld,%lld) nb=(%llu,%llu,%llu) q_len=%d kv_len=%d splits=%d\n",
+                (int) mask->type, (long long) mask->ne[0], (long long) mask->ne[1], (long long) mask->ne[2],
+                (unsigned long long) mask->nb[0], (unsigned long long) mask->nb[1], (unsigned long long) mask->nb[2],
+                q_len, kv_len, splits);
+            const int64_t n = mask->ne[0];
+            std::vector<half> col(n);
+            const half * rowq = (const half *) mask->data + (int64_t)(q_len - 1) * n;
+            CUDA_CHECK(cudaMemcpyAsync(col.data(), rowq, n * 2, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int live = 0; for (int64_t k = 0; k < n; ++k) { if (__half2float(col[k]) > -30000.0f) live = (int) k + 1; }
+            fprintf(stderr, "[sm70-d256-dec dbg] last-q scan: live=%d first=%f mid=%f last=%f\n",
+                live, __half2float(col[0]), __half2float(col[n/2]), __half2float(col[n-1]));
+
+        }
+    }
+    // dst dim order is NOT fixed relative to Q: observed (D, heads, q_len) on
+    // this graph (Q was (D, q_len, heads)). Derive the head/token strides by
+    // matching ne against heads_q/q_len instead of assuming positions.
+    int64_t dst_tok_stride = 0, dst_head_stride = 0;
+    for (int i = 1; i < 4; ++i) {
+        if (dst->ne[i] == (int64_t) heads_q && !dst_head_stride) { dst_head_stride = dst->nb[i] / sizeof(float); }
+        else if (dst->ne[i] == (int64_t) q_len && !dst_tok_stride) { dst_tok_stride = dst->nb[i] / sizeof(float); }
+    }
+    GGML_ASSERT(dst_head_stride && dst_tok_stride);
+    sm70_d256_decode::sm70_d256_decode_merge_kernel<<<rows_total, 128, 0, stream>>>(
+        partial_acc, partial_m, partial_l, (float *) dst->data,
+        rows_total, splits, dst_tok_stride, dst_head_stride, q_len);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ------------------------------------------------------------------- public
 bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     if (cc != GGML_CUDA_CC_VOLTA || sm70_env_disabled()) {
@@ -311,6 +447,25 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     if (Q->ne[0] != SM70_D256_D || K->ne[0] != SM70_D256_D || V->ne[0] != SM70_D256_D) {
         sm70_d256_probe("REJECT: head_dim != 256", cc, Q, K, V, mask);
         return false;
+    }
+    // ---- decode (WP1-P1): small-width ubatches on the TC decode kernel ----
+    // GQA group packed per CTA; q_len = verify/speculation width (1..8).
+    if (sm70_d256_decode_enabled()) {
+        const int gqa_d = (int) (Q->ne[2] / K->ne[2]);
+        const bool kv_ok_d = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0)
+                          && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0)
+                          && (K->type != GGML_TYPE_F16 || K->nb[0] == sizeof(half))
+                          && (V->type != GGML_TYPE_F16 || V->nb[0] == sizeof(half));
+        const bool ok_d = Q->ne[1] >= 1 && Q->ne[1] <= 8 && mask && Q->ne[3] == 1
+                       && Q->ne[2] % K->ne[2] == 0 && (gqa_d == 6 || gqa_d == 8) && kv_ok_d;
+        if (ok_d) {
+            sm70_d256_probe("ACCEPT: sm70 d256 decode kernel", cc, Q, K, V, mask);
+            return true;
+        }
+        if (Q->ne[1] <= 8) {
+            sm70_d256_probe("REJECT: decode shape not eligible (gqa/batch/types)", cc, Q, K, V, mask);
+            return false;
+        }
     }
     if (!mask || mask->ne[0] < 256 || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches -> stock
         sm70_d256_probe("REJECT: no mask or small batch", cc, Q, K, V, mask);
@@ -368,6 +523,30 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
 // the stock f16_extra model): [K dequant][V dequant] (f16_extra layout) +
 // Qs (padded f16 Q) + Os (f16 output staging).
 size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
+    // ---- decode scratch: f16 KV mirrors + f32 split partials (WP1-P1) ----
+    // MUST stay consistent with the decode branch of _supported() and the
+    // launcher's carve: mirrors sized by the stock f16_extra formula (q4-direct
+    // is NOT used by decode), partials sized at the split CAPACITY bound
+    // (launcher derives splits from kv_len <= K->ne[1], never exceeding this).
+    {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        if (sm70_d256_decode_enabled() && Q->ne[0] == SM70_D256_D
+                && Q->ne[1] >= 1 && Q->ne[1] <= 8 && Q->ne[3] == 1) {
+            const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+            const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+                ggml_cuda_flash_attn_ext_get_f16_extra_data(dst,
+                    K->type != GGML_TYPE_F16,
+                    !(V_is_K_view && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16);
+            const size_t f16_extra_size = (size_t) (f16_extra.end - ((uintptr_t) dst->data + ggml_nbytes(dst)));
+            const int hkv = (int) K->ne[2];
+            const int64_t rows_total = (int64_t) Q->ne[2] * Q->ne[1];
+            const int64_t partials = (int64_t) sm70_d256_dec_split_cap(hkv) * rows_total
+                                   * (SM70_D256_D + 2) * sizeof(float);
+            return ggml_nbytes(dst) + GGML_PAD(f16_extra_size, 128) + GGML_PAD(partials, 128);
+        }
+    }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -409,6 +588,11 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+
+    if (sm70_d256_decode_enabled() && Q->ne[1] <= 8) {
+        ggml_cuda_flash_attn_ext_sm70_d256_decode(ctx, dst);
+        return;
+    }
 
     const int hkv    = (int) K->ne[2];
     const int gqa    = (int) (Q->ne[2] / K->ne[2]);
