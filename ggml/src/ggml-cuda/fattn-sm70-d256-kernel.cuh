@@ -405,12 +405,17 @@ __device__ __forceinline__ void splitd_n32_online_softmax(
 // paths produce identical f16 bits.
 // ---------------------------------------------------------------------------
 
+// Canonical ggml q4_0 layout (ggml-quants.c writer / convert.cu reader / cpy-utils.cuh
+// GPU cache writer all agree): qs byte b holds element b in the LOW nibble and
+// element b+16 in the HIGH nibble. The original port read nibble-sequential
+// (byte b = elems 2b/2b+1) — self-consistent with the harness CPU ref but wrong
+// against every ggml writer; see docs/q4-layout-audit.md.
 __device__ __forceinline__ __half sm70_q4_dequant_one(
         const uint8_t * __restrict__ row_base, const int d) {
     const uint8_t * b = row_base + (d >> 5) * 18;
     const float s = __half2float(*reinterpret_cast<const __half *>(b));
-    const uint8_t pair = b[2 + ((d & 31) >> 1)];
-    const int q = (d & 1) ? (pair >> 4) : (pair & 0x0F);
+    const uint8_t byte = b[2 + (d & 15)];
+    const int q = (d & 16) ? (byte >> 4) : (byte & 0x0F);
     return __float2half_rn(((float) q - 8.0f) * s);
 }
 
@@ -424,17 +429,15 @@ __device__ __forceinline__ void sm70_q4_dequant_group(
     static_assert(kGrp == 4 || kGrp == 8, "group must be 4 or 8");
     const uint8_t * b = row_base + (d >> 5) * 18;
     const float s = __half2float(*reinterpret_cast<const __half *>(b));
-    const int off = 2 + ((d & 31) >> 1);
-    uint32_t nib;
-    if constexpr (kGrp == 4) {
-        nib = *reinterpret_cast<const uint16_t *>(b + off);
-    } else {
-        nib = (uint32_t) *reinterpret_cast<const uint16_t *>(b + off)
-            | ((uint32_t) *reinterpret_cast<const uint16_t *>(b + off + 2) << 16);
-    }
+    // Canonical {j, j+16} nibble layout; a kGrp=4/8 chunk at an 4/8-aligned d
+    // never straddles the 16 boundary, so it is all-LOW or all-HIGH nibbles.
+    const int off = 2 + (d & 15);
+    const bool low = (d & 16) == 0;
 #pragma unroll
     for (int j = 0; j < kGrp; ++j) {
-        out[j] = __float2half_rn(((float) ((nib >> (4 * j)) & 0xF) - 8.0f) * s);
+        const uint8_t byte = b[off + j];
+        const int q = low ? (byte & 0x0F) : (byte >> 4);
+        out[j] = __float2half_rn(((float) q - 8.0f) * s);
     }
 }
 
