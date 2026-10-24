@@ -307,6 +307,17 @@ static bool sm70_d256_decode_enabled() {
 static int sm70_d256_dec_split_cap(int hkv) {
     return std::min(32, std::max(1, 96 / std::max(hkv, 1)));
 }
+// q4-direct for decode: in-kernel q4_0 loads, no f16 mirror. Default OFF
+// until the perf A/B verdict; the mirror costs 2x the K bytes RW per step at
+// deep context, so this is expected to flip once measured.
+static bool sm70_d256_dec_q4_direct() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SM70_D256_DEC_Q4");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 static int sm70_d256_dec_splits(int kv_len, int hkv) {
     const int s = std::min((kv_len + 511) / 512, sm70_d256_dec_split_cap(hkv));
     return std::max(s, 1);
@@ -340,19 +351,23 @@ static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context 
     cudaStream_t stream = ctx.stream();
     const char * base = (const char *) dst->data + ggml_nbytes(dst);
 
-    // f16 mirrors (decode never uses q4-direct in P1).
+    // q4-direct (P2): raw in-kernel q4_0 loads, no mirror for that tensor.
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const bool k_direct = K->type == GGML_TYPE_Q4_0 && sm70_d256_dec_q4_direct();
+    const bool v_direct = V->type == GGML_TYPE_Q4_0 && sm70_d256_dec_q4_direct();
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst,
-            K->type != GGML_TYPE_F16,
-            !(V_is_K_view && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16);
+            K->type != GGML_TYPE_F16 && !k_direct,
+            !(V_is_K_view && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16 && !v_direct);
     sm70_d256_dequant_kv((ggml_tensor *) K, (ggml_tensor *) V, f16_extra,
-                         V_is_K_view, stream, /*k_direct=*/false, /*v_direct=*/false);
+                         V_is_K_view, stream, k_direct, v_direct);
 
     const half * K_h2; const half * V_h2;
     int64_t k_row, k_head, v_row, v_head;
     if (K->type == GGML_TYPE_F16) {
         K_h2 = (const half *) K->data; k_row = K->nb[1] / sizeof(half); k_head = K->nb[2] / sizeof(half);
+    } else if (k_direct) {
+        K_h2 = (const half *) K->data; k_row = K->nb[1]; k_head = K->nb[2];   // BYTES
     } else {
         K_h2 = (const half *) f16_extra.K; k_row = (int64_t) K->ne[2] * K->ne[0]; k_head = K->ne[0];
     }
@@ -360,6 +375,8 @@ static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context 
         V_h2 = K_h2; v_row = k_row; v_head = k_head;
     } else if (V->type == GGML_TYPE_F16) {
         V_h2 = (const half *) V->data; v_row = V->nb[1] / sizeof(half); v_head = V->nb[2] / sizeof(half);
+    } else if (v_direct) {
+        V_h2 = (const half *) V->data; v_row = V->nb[1]; v_head = V->nb[2];   // BYTES
     } else {
         V_h2 = (const half *) f16_extra.V; v_row = (int64_t) V->ne[2] * V->ne[0]; v_head = V->ne[0];
     }
@@ -377,15 +394,21 @@ static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context 
     // mask (n_kv, q_len) f16: the last query row spans every live key.
     const half * mask_last_q = (const half *) mask->data + (int64_t) (q_len - 1) * mask->ne[0];
     const int64_t mask_q_stride = 1;   // k contiguous within a query row
-    if (gqa == 6) {
-        sm70_d256_decode::sm70_d256_decode_kernel<6><<<grid, 128, 0, stream>>>(
-            (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
-            q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l);
-    } else {
-        sm70_d256_decode::sm70_d256_decode_kernel<8><<<grid, 128, 0, stream>>>(
-            (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
-            q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l);
-    }
+    auto launch = [&](auto kk4, auto vv4) {
+        if (gqa == 6) {
+            sm70_d256_decode::sm70_d256_decode_kernel<6, kk4, vv4><<<grid, 128, 0, stream>>>(
+                (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
+                q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l);
+        } else {
+            sm70_d256_decode::sm70_d256_decode_kernel<8, kk4, vv4><<<grid, 128, 0, stream>>>(
+                (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
+                q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l);
+        }
+    };
+    if (k_direct && v_direct)      { launch(std::true_type{}, std::true_type{}); }
+    else if (k_direct)             { launch(std::true_type{}, std::false_type{}); }
+    else if (v_direct)             { launch(std::false_type{}, std::true_type{}); }
+    else                           { launch(std::false_type{}, std::false_type{}); }
     CUDA_CHECK(cudaGetLastError());
     {
         static bool once = [] { return getenv("LLAMA_SM70_D256_DEBUG") != nullptr; }();
@@ -535,10 +558,12 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
         if (sm70_d256_decode_enabled() && Q->ne[0] == SM70_D256_D
                 && Q->ne[1] >= 1 && Q->ne[1] <= 8 && Q->ne[3] == 1) {
             const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+            const bool k_dir = K->type == GGML_TYPE_Q4_0 && sm70_d256_dec_q4_direct();
+            const bool v_dir = V->type == GGML_TYPE_Q4_0 && sm70_d256_dec_q4_direct();
             const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
                 ggml_cuda_flash_attn_ext_get_f16_extra_data(dst,
-                    K->type != GGML_TYPE_F16,
-                    !(V_is_K_view && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16);
+                    K->type != GGML_TYPE_F16 && !k_dir,
+                    !(V_is_K_view && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16 && !v_dir);
             const size_t f16_extra_size = (size_t) (f16_extra.end - ((uintptr_t) dst->data + ggml_nbytes(dst)));
             const int hkv = (int) K->ne[2];
             const int64_t rows_total = (int64_t) Q->ne[2] * Q->ne[1];

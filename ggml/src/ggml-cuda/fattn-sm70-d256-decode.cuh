@@ -171,13 +171,46 @@ constexpr int kDecPVChunks  = kDecBc / 8;       // 2
 constexpr int kDecSmemPad   = 8;
 constexpr int kDecSmemStride = kDecD + kDecSmemPad;
 
-template <int GQA>
+// q4_0 in-kernel dequant (8 consecutive dims, one aligned 4-byte nibble load).
+// Rounding semantics are pinned to convert.cu dequantize_block_q4_0 /
+// fattn-sm70-d256-kernel.cuh sm70_q4_dequant_group: value = (q-8)*scale with
+// the product exact in f32, one RN to half - bit-identical to the staged path.
+// Block layout: [f16 scale (2B)][32 x 4-bit (16B)] = 18B per 32 dims; row_base
+// = cache + token*row_stride + head*head_stride (byte strides, [ctx][head][blk]).
+// Canonical ggml q4_0 layout (ggml-quants.c writer / convert.cu reader agree):
+// qs byte b holds element b in the LOW nibble and element b+16 in the HIGH
+// nibble. An 8-aligned dim chunk never straddles the 16 boundary, so a chunk
+// is either all-LOW (d&16==0) or all-HIGH nibbles of 8 consecutive bytes.
+// Rounding matches convert.cu under nvcc FMA contraction: RN(exact d*(q-8)).
+__device__ __forceinline__ void sm70_dec_q4_dequant8(
+        const uint8_t * __restrict__ row_base, int d, half out[8]) {
+    const uint8_t * blk  = row_base + (d >> 5) * 18;
+    const float     s    = __half2float(*reinterpret_cast<const half *>(blk));
+    const int       off  = 2 + (d & 15);        // first byte of this 8-dim chunk
+    uint64_t        b8   = 0;                    // 8 bytes via 4 aligned u16 loads
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        b8 |= (uint64_t) *reinterpret_cast<const uint16_t *>(blk + off + 2 * k) << (16 * k);
+    }
+    const bool low = (d & 16) == 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint8_t byte = (uint8_t) ((b8 >> (8 * j)) & 0xFF);
+        const int     q    = low ? (byte & 0xF) : (byte >> 4);
+        out[j] = __float2half_rn(((float) q - 8.0f) * s);
+    }
+}
+
+template <int GQA, bool Kq4 = false, bool Vq4 = false>
 __global__ void __launch_bounds__(kDecThreads, 2) sm70_d256_decode_kernel(
         const float * __restrict__ q,             // f32 (D, q_len, heads_q, 1)
         int64_t q_row_stride, int64_t q_head_stride,
         const half * __restrict__ k, const half * __restrict__ v,
         int64_t k_row_stride, int64_t k_head_stride,
         int64_t v_row_stride, int64_t v_head_stride,
+        // Under Kq4/Vq4 the k/v pointers are RAW q4_0 block bytes and the
+        // row/head strides are BYTES ([ctx][head][block]); otherwise f16
+        // element strides. Same convention as the prefill kernel q4-direct.
         int q_len, int kv_len, float scale, int splits,
         const half * __restrict__ mask_last_q, int64_t mask_q_stride,
         float * __restrict__ partial_acc, float * __restrict__ partial_m,
@@ -205,29 +238,22 @@ __global__ void __launch_bounds__(kDecThreads, 2) sm70_d256_decode_kernel(
     // bottom-right causal mask sees every live key. Split boundaries stay
     // capacity-derived (static grid, CUDA-graph friendly); only the per-CTA
     // end bound and the causal base use the live length.
+    // Binary search for the live boundary: the causal last-query row is
+    // monotone (valid ... valid, -inf ... -inf), so log2(capacity) broadcast
+    // probes replace the linear scan (which re-read 458KB per CTA — 44MB/step
+    // across the grid at 229k capacity, a measured ~10% decode tax).
     int live = 0;
     {
-        __shared__ int live_s[kDecThreads / 32];
-        int local_max = -1;
-        for (int k = tid; k < kv_len; k += kDecThreads) {
-            if (__half2float(mask_last_q[(int64_t) k * mask_q_stride]) > -30000.0f) {
-                local_max = k;
+        int lo = 0, hi = kv_len;   // invariant: mask[lo-1] valid, mask[hi] invalid
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (__half2float(mask_last_q[(int64_t) mid * mask_q_stride]) > -30000.0f) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            local_max = max(local_max, __shfl_xor_sync(Full, local_max, off));
-        }
-        if ((tid & 31) == 0) { live_s[tid >> 5] = local_max; }
-        __syncthreads();
-        if (tid == 0) {
-            int m = -1;
-#pragma unroll
-            for (int w = 0; w < kDecThreads / 32; ++w) { m = max(m, live_s[w]); }
-            live_s[0] = m + 1;
-        }
-        __syncthreads();
-        live = live_s[0];
+        live = lo;
     }
     const int kv_offset = live - q_len;           // bottom-right causal base
 
@@ -286,8 +312,24 @@ __global__ void __launch_bounds__(kDecThreads, 2) sm70_d256_decode_kernel(
                 half * kd = &k_s[kl * kDecSmemStride + d];
                 half * vd = &v_s[kl * kDecSmemStride + d];
                 if (key < k_end) {
-                    *(int4 *) kd = *(const int4 *) (k + ((int64_t) key * k_row_stride + k_head_off + d));
-                    *(int4 *) vd = *(const int4 *) (v + ((int64_t) key * v_row_stride + v_head_off + d));
+                    if constexpr (Kq4) {
+                        const uint8_t * row =
+                            reinterpret_cast<const uint8_t *>(k) + (int64_t) key * k_row_stride + k_head_off;
+                        half tmp[8];
+                        sm70_dec_q4_dequant8(row, d, tmp);
+                        *(int4 *) kd = *reinterpret_cast<const int4 *>(tmp);
+                    } else {
+                        *(int4 *) kd = *(const int4 *) (k + ((int64_t) key * k_row_stride + k_head_off + d));
+                    }
+                    if constexpr (Vq4) {
+                        const uint8_t * row =
+                            reinterpret_cast<const uint8_t *>(v) + (int64_t) key * v_row_stride + v_head_off;
+                        half tmp[8];
+                        sm70_dec_q4_dequant8(row, d, tmp);
+                        *(int4 *) vd = *reinterpret_cast<const int4 *>(tmp);
+                    } else {
+                        *(int4 *) vd = *(const int4 *) (v + ((int64_t) key * v_row_stride + v_head_off + d));
+                    }
                 } else {
                     *(int4 *) kd = make_int4(0, 0, 0, 0);
                     *(int4 *) vd = make_int4(0, 0, 0, 0);
