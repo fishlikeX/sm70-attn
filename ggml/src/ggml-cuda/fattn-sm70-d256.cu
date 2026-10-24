@@ -479,7 +479,11 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
                           && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0)
                           && (K->type != GGML_TYPE_F16 || K->nb[0] == sizeof(half))
                           && (V->type != GGML_TYPE_F16 || V->nb[0] == sizeof(half));
-        const bool ok_d = Q->ne[1] >= 1 && Q->ne[1] <= 8 && mask && Q->ne[3] == 1
+        // w==1 routes to stock: the SIMT vec kernel is the single-row optimum
+        // (measured -3..-6% for the TC kernel at width 1); the TC kernel owns
+        // verify widths w>=2 where GQA row packing + tensor-core math pay
+        // (measured +20.5% (f16 V) / +30.8% (q4 V) at 174k spec-verify).
+        const bool ok_d = Q->ne[1] >= 2 && Q->ne[1] <= 8 && mask && Q->ne[3] == 1
                        && Q->ne[2] % K->ne[2] == 0 && (gqa_d == 6 || gqa_d == 8) && kv_ok_d;
         if (ok_d) {
             sm70_d256_probe("ACCEPT: sm70 d256 decode kernel", cc, Q, K, V, mask);
@@ -614,7 +618,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    if (sm70_d256_decode_enabled() && Q->ne[1] <= 8) {
+    if (sm70_d256_decode_enabled() && Q->ne[1] >= 2 && Q->ne[1] <= 8) {
         ggml_cuda_flash_attn_ext_sm70_d256_decode(ctx, dst);
         return;
     }
