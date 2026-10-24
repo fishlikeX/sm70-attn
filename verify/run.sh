@@ -24,7 +24,7 @@ mode="${1:-n}"
 # The harness is valid ONLY against the exact kernel that was static-audited.
 # If the repo drifted, fail loudly instead of producing unverifiable numbers.
 kmd5="$(tr -d '\r' < "$cuda/fattn-sm70-d256-kernel.cuh" | md5sum | cut -d' ' -f1)"   # CRLF-normalized
-expect="157fa4abc67734e7a681afbd2e2b5f88"   # fattn-sm70-d256-kernel.cuh @ HEAD 1921132d (LF-normalized) — drift audit 2026-10-24: daca614->HEAD = q4-direct (c96bae5, Kq4/Vq4 + 4 load-site branches), SplitKV3 (b472e48+fd718f9, segment bounds/partial out/-1e30 guard), f32-out (2722ed2), merge denom guard (1921132d); RegP 3bcab55 reverted by 707cf24 (net 0); 12 hunks all accounted, 23/23 PASS on this state
+expect="250dbaa11b9084776b417d3364649d97"   # fattn-sm70-d256-kernel.cuh @ worktree 2026-10-24b (LF) — drift from 157fa4ab: q4 layout fix ONLY (sm70_q4_dequant_one + _group sequential->canonical {j,j+16}; evidence: docs/q4-layout-audit.md, triple-verified against ggml-quants.c/convert.cu/cpy-utils.cuh); decode tester 13/13 on this state
 if [ "$kmd5" != "$expect" ]; then
     echo "kernel md5 drift: $kmd5 != $expect" >&2
     echo "— audit the diff / update the harness before trusting any numbers" >&2
@@ -32,13 +32,14 @@ if [ "$kmd5" != "$expect" ]; then
 fi
 echo "kernel md5 ok: $kmd5"
 
-if command -v nvcc >/dev/null 2>&1; then :; else
+NVCC_BIN=$(command -v nvcc || ls /usr/local/cuda*/bin/nvcc 2>/dev/null | head -1)
+if [ -z "$NVCC_BIN" ]; then
     echo "nvcc not found on PATH — is the CUDA toolkit installed in WSL2?" >&2
     exit 3
 fi
 
 echo "== build =="
-nvcc -O2 -std=c++17 -arch=sm_70 -I "$inc" -I "$cuda" "$here/sm70_verify.cu" -o "$bin" || {
+"$NVCC_BIN" -O2 -std=c++17 -arch=sm_70 -I "$inc" -I "$cuda" "$here/sm70_verify.cu" -o "$bin" || {
     echo "nvcc build failed" >&2; exit 4; }
 
 # ---- mode envs ----------------------------------------------------------------

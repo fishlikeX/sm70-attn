@@ -72,12 +72,14 @@ static void quant_row_q4_0(const float * x, uint8_t * y, int k) {
     }
 }
 
+// canonical {j, j+16} nibble layout - matches the fixture writer above and
+// every ggml writer/reader (see docs/q4-layout-audit.md)
 static float deq_q4_one(const uint8_t * row_base, int d) {
     const uint8_t * b = row_base + (d >> 5) * 18;
     __half s;
     memcpy(&s, b, 2);
-    const uint8_t pair = b[2 + ((d & 31) >> 1)];
-    const int q = (d & 1) ? (pair >> 4) : (pair & 0x0F);
+    const uint8_t byte = b[2 + (d & 15)];
+    const int q = (d & 16) ? (byte >> 4) : (byte & 0x0F);
     return __half2float(__float2half_rn(((float) q - 8.0f) * __half2float(s)));
 }
 
