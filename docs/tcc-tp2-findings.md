@@ -39,11 +39,23 @@ prefill：TP2 492-509 tok/s（单卡 ~470）。
   （KV 扫描 116k vs 174k）、权重（Q8 接受率通常更高）、通信 overlay 解释——均为
   可追赶项，非原理差距。
 
+## 追加（同日晚）：GSQ 生产权重 + n_max 扫描 + 层切分判死
+
+- **生产权重纠正**：GSQ-RCO-IQ3_S-mtp（11.2GB）为 3.8 时代最优 27B 权重（维护者定论），
+  Q4_K_XL 此前仅为基准惯性。全栈三点：
+  单卡 GSQ 26.72（vs Q4 单卡 24.04，+11%）；层切分 GSQ 26.73（**判死**：decode 零增益，
+  同步层链无重叠；prefill 倒是 +39%）；**TP2×GSQ = 34.99 tok/s @174k（当前生产冠军）**，
+  接受率 0.61/mean 2.79（好权重连接受率都更高）。
+- n_max 扫描：4=31.75 < 3=33.18（Q4 下），3 为最优；接受率 0.55-0.61 撑不起 4。
+- meta×GSQ 断言（bufs[i] 空）：满上下文复测未复现（fprintf 级重编后两次加载皆成功），
+  判为偶发/竞态观察项；若再现，按 meta_buf_ctx->bufs[i] 分配路径查 IQ3_S 切片。
+- 层切分负结果的原因记录：decode 的小批量同步层链无流水重叠；勿再投入。
+
 ## 生产建议（当前）
 
-深上下文生产：Windows TCC + `-sm tensor -fit off -ctk q4_0 -ctv q4_0 --spec-type
-draft-mtp --spec-draft-n-max 3` + `LLAMA_SM70_D256_DECODE=1 LLAMA_SM70_D256_DEC_Q4=1`
-（模型放本地盘）。WDDM 模式同配置可用但通信 -28%。
+深上下文生产（34.99 tok/s 配方）：Windows TCC + `D:\models\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf`
++ `-sm tensor -fit off -ctk q4_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 3`
++ `LLAMA_SM70_D256_DECODE=1 LLAMA_SM70_D256_DEC_Q4=1`（模型本地盘；CUDA_VISIBLE_DEVICES=0,1）。
 
 ## 后续路线（按价值）
 
