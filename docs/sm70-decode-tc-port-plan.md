@@ -17,8 +17,22 @@
 - spec 模式下贪心轨迹会分歧：f16 QK（TC）vs f32 点积（SIMT）在近并列 logit 翻转，
   属数值路径固有差异；接受率 0.63 vs 0.675 健康。TC decode 的正确性门因此定义为
   harness 精度 + 接受率 + 输出质量，而非 bit 一致。
-- 默认开关：DEC/DEC_Q4 保持 opt-in（README "measured verdict" 风格）；
-  推荐 spec + 深上下文生产负载开启（+20%）。
+- 默认开关：DEC/DEC_Q4 保持 opt-in（README "measured verdict" 风格）；推荐
+  spec + 深上下文生产负载开启。
+
+## P3 终局（同日）
+
+- **w=1 路由回 stock**（supported/launcher 收紧为 q_len>=2）：stock vec 是单行最优
+  （实测 TC 内核 w=1 为 -3..-6%）；TC 内核只接 verify 宽度。终测：
+  spec 深档（生产 q4/q4, w=3, 174k）18.50 -> **24.04 tok/s（+30.0%）**；
+  纯 decode 深/浅精确持平（15.14/15.13、28.90/28.96，输出 IDENTICAL）——
+  内核成为严格改进（verify 大赢、单宽零回退）。
+- **负面结果档案：寄存器预取（P3a）实测 -2.6%（24.11 -> 23.49），已回退**。
+  ninfer PrefetchKv 模式（下一 tile 原始字节驻寄存器）在本内核的 96-CTA 网格上
+  无益：跨 CTA 延迟隐藏已饱和，软件流水线反添 16 寄存器（164->180）调度压力。
+  HOOLIGAN 的 +16~28% 是单 CTA/SM 延迟受限微基准语境，不可外推。tester 13/13
+  曾全绿（误差逐位不变）——正确但更慢，按负面结果纪律弃置。
+- q4/q4（生产 dtype）早前另测 +30.8%（18.43 -> 24.11），与终测 +30.0% 同带内。
 
 ## P1 实测记录（V100-SXM2-32GB, WSL2, Q4_K_XL + q4_0 K + f16 V）
 
