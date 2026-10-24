@@ -1,6 +1,24 @@
 # SM70 D256 Tensor-Core Decode Attention — 移植设计（WP1）
 
-状态：**P1 已落地并通过正确性门禁（2026-10-24）**。P2（q4-direct）待做。
+状态：**P1+P2 已落地并过全部六道门（2026-10-24，GPU2 干净卡终测）**。默认 opt-in。
+
+## P2 终测记录（干净 GPU2；注意：早前 +47% 系 GPU1 被生产进程占用时的污染数据，作废）
+
+- 门1 decode 独立测试器 13/13（含 q4 规范布局 case）
+- 门2 prefill 电池 PASS（q4 系 case 以修正后参照重跑）
+- 门3 logit_q4direct：direct vs staged **逐位一致 max|dp|=0**（该门自 c96bae56de 以来首次真正满足）
+- 门4 纯 decode A/B：浅/深双档 IDENTICAL（贪心 128/48 tok 零分叉）
+- 门5 性能（诚实记录）：w=1 纯 decode 浅 -3.4% / 深 -6%（stock vec 为 w=1 极致优化，
+  TC 拓扑的 partial/merge 固定开销在 w=1 不摊销）；
+  **生产配置（DFlash2 投机 verify, w=3, 174k 深档）：19.35 → 23.32 tok/s = +20.5%**
+- 门6 PPL 2.7771±0.03034 两侧逐位一致（prefill 路径对照）
+- mask 活长度扫描改二分（单调边界，18 次广播探测；线性版每 CTA 扫 458KB × 96 CTA，
+  实测吃掉 ~4-10%）
+- spec 模式下贪心轨迹会分歧：f16 QK（TC）vs f32 点积（SIMT）在近并列 logit 翻转，
+  属数值路径固有差异；接受率 0.63 vs 0.675 健康。TC decode 的正确性门因此定义为
+  harness 精度 + 接受率 + 输出质量，而非 bit 一致。
+- 默认开关：DEC/DEC_Q4 保持 opt-in（README "measured verdict" 风格）；
+  推荐 spec + 深上下文生产负载开启（+20%）。
 
 ## P1 实测记录（V100-SXM2-32GB, WSL2, Q4_K_XL + q4_0 K + f16 V）
 
