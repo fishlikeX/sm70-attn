@@ -57,6 +57,17 @@ prefill：TP2 492-509 tok/s（单卡 ~470）。
 + `-sm tensor -fit off -ctk q4_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 3`
 + `LLAMA_SM70_D256_DECODE=1 LLAMA_SM70_D256_DEC_Q4=1`（模型本地盘；CUDA_VISIBLE_DEVICES=0,1）。
 
+## 追加（同日夜）：ubatch 调优 + WyvernTKC 单发 P2P allreduce 移植
+
+- **-ub 调优（零代码）**：根因=每 ubatch 全量权重 dequant（nsys 画像 ~1960 实例实证）。
+  中档 30k：ub8192 prefill 662（+19%）decode 78.85；深档 ub512 仍最优（34.99 基线）。
+- **P2P allreduce 移植**（WyvernTKC/llama.cpp-4xV100，MIT，allreduce-p2p.cu/.cuh）：
+  单发对端写 LL 内核，接在 GGML_CUDA_ALLREDUCE 选择器之后、internal 链之前，
+  仅认领小连续 F32 消息（其余回退）。本地化改动：fold_args 结构注入 .cuh、MoE sigmoid
+  就地替身。**实测：30k decode 78.85 → 90.60（+14.9%）；174k decode 34.99 → 37.37（+6.8%）**。
+- 最优配方分场景：深档 ub512+p2p=37.37；中档 ub8192+p2p=90.60；prefill 大 ub 662-678。
+- 今日 174k 全阶梯：15.13 → 24.04 → 34.99 → **37.37**（+147% vs 晨间起点）。
+
 ## 后续路线（按价值）
 
 1. 移植 dual-v100 fork 的 matched-allreduce overlay（+3-4%）

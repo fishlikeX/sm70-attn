@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/allreduce-p2p.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1042,6 +1043,7 @@ struct ggml_backend_cuda_comm_context {
     // failures return false; the meta backend's generic implementation then
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
+    ggml_cuda_p2p_ar *          p2p_ar      = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
@@ -1209,10 +1211,11 @@ static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
 }
 
 static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
-    if (comm_ctx_v == nullptr) {
-        return;
-    }
-    delete static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+
+    if (comm_ctx_v == nullptr) { return; }
+    auto * cf_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    ggml_cuda_p2p_ar_free(cf_ctx->p2p_ar);
+    delete cf_ctx;
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,6 +1312,12 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         }
     }
 
+    // Independent of the mode above: small messages are latency-bound, where a ring loses
+    // badly to a single round of direct peer writes (port note: measured 40us/msg via the
+    // internal ar_add chain on 2x NVLink V100; 128 such messages per decode step). Declines
+    // fall through to the selected mode. (ported from WyvernTKC/llama.cpp-4xV100, MIT)
+    ret->p2p_ar = ggml_cuda_p2p_ar_init(ret->dev_ids.data(), ret->dev_ids.size());
+
     return ret;
 }
 
@@ -1319,6 +1328,12 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    // The one-shot P2P path only claims small, contiguous F32 messages; anything it
+    // declines falls through to the mode chosen by the init chain.
+    if (comm_ctx->p2p_ar != nullptr &&
+            ggml_cuda_p2p_ar_allreduce(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors)) {
+        return true;
+    }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
