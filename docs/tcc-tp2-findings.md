@@ -146,6 +146,22 @@ prefill：TP2 492-509 tok/s（单卡 ~470）。
 - **可用状态**：c=32768（32k 上下文内）全栈稳定可跑；c=229376 有 flaky 风险，
   重启可解（幸运抽签）。
 
+## 追加（深夜六）：flaky 之谜破案 + dequant 内核定稿
+
+- **flaky 崩溃根因**：`operation not permitted when stream is capturing`——
+  iq4_xs dequant（MTP eh_proj，IQ4_XS）在 **draft graph 捕获期**被记录，而调试用的
+  `cudaStreamSynchronize` 在捕获期非法——**诊断调用本身是毒药**（dbg_deep 崩在捕获期
+  实锤）。移除调试同步后全栈干净跑通完整 174k 请求（pp=432 tg=44.56，无崩溃）。
+  此前 flaky_loop 的 6/6、4/4 崩溃用的是 400k 截断 prompt + n_predict=2 的特殊请求
+  形态，与全量请求行为不同——该形态下的崩溃触发器未完全定案（dequant-fast env 开关
+  相关），留档。
+- **dequant 内核终测**：真机深档 pp=432.44（vs 无 dequant-fast 437.12——持平带内）。
+  内核本体 bench 2-4×，但 ub512 深档的 dequant 份额已被 ub 摊薄 + IQ skinny 接管，
+  净收益趋零。保留（逐位一致、无副作用、bench 实证），作为 ③ 融合 GEMM 的 LUT
+  解码基础。env LLAMA_SM70_DEQUANT_FAST 默认开。
+- **教训**：graph 捕获期的流同步/查询是非法操作；调试注入必须验证与捕获的兼容性；
+  消融实验的 env 设置必须验证端到端生效（dqoff 消融因 ps1 覆盖 env 而无效过一次）。
+
 ## 后续路线（按价值）
 
 1. 移植 dual-v100 fork 的 matched-allreduce overlay（+3-4%）
