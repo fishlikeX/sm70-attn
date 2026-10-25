@@ -68,6 +68,19 @@ prefill：TP2 492-509 tok/s（单卡 ~470）。
 - 最优配方分场景：深档 ub512+p2p=37.37；中档 ub8192+p2p=90.60；prefill 大 ub 662-678。
 - 今日 174k 全阶梯：15.13 → 24.04 → 34.99 → **37.37**（+147% vs 晨间起点）。
 
+## 追加（同夜深）：GDN concat 融合尝试 — 受阻归档
+
+- concat_non_cont 的真实来源**不是** wqkv bias（GSQ 的 GGUF 本就带融合 attn_qkv_b，
+  图构建器的 concat 分支不执行），而是 **MTP 头的 eh_proj**（qwen35/qwen35moe/qwen3next
+  的 `ggml_concat(e_norm, h_norm)` + eh_proj matmul，每 MTP 轮一次）。
+- 三次尝试（view 步长修正 → cont 输入归一化）均卡在 `ggml_can_repeat` 断言：
+  build_hadamard_input 对连续/跨步输入走不同分支，QUASAR 系权重的 Hadamard 折叠
+  使两个子 GEMV 的输出形状不对称，需要逐 artifact 适配（rot 表按权重走）。
+  收益上限 ~1.3%/轮，按投入产出纪律**挂起**；loader 融合机制（bias_fuse 系列）
+  因 GGUF 查名机制限制同样搁置，留档可复活。
+- 若复活：从 rot 表对 eh_proj 的具体 perm 入手，或上游化一个 concat-elimination
+  pass 到 ggml 图优化器。
+
 ## 后续路线（按价值）
 
 1. 移植 dual-v100 fork 的 matched-allreduce overlay（+3-4%）
