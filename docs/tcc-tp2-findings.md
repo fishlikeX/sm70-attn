@@ -117,6 +117,20 @@ prefill：TP2 492-509 tok/s（单卡 ~470）。
   **47.27（+212%）**。prefill：470 → **468-467.94**（持平——prefill 与 decode
   首次同时受益）。
 
+## 追加（同夜四）：prefill 叠满终点 + ub16384 判死
+
+- **深档叠满**（ub8192+skinny2+IQ+splits48）：prefill **501.67**（基线 437 = +14.8%）。
+  中档叠满 674（≈基线——22k 下 dequant 已被 ub8192 摊薄，skinny 无增量）。
+- **ub16384 判死**：meta 缓冲分配 OOM（meta.cpp:1744 bufs[i] 空）——激活工作区翻倍
+  挤爆 32GB 卡。ub8192 为该权重的 prefill 上限。
+- **prefill 公平对标**（按 FLOP 计效率）：174k 全档工作量 = 线性 9.4 + attention 二次项
+  ~6 = 15.4 PFLOP / 348s = **44.3 TFLOPS 有效**；dual-v100 833@117k = 9 PFLOM/140s =
+  64 TFLOPS。公平差距 1.44×，来源 = IQ3_S 解包 ALU（skinny mode 2 的核内展开只省了
+  搬运未省 ALU）+ cutlass 形状效率。
+- **下一档的唯一大石头**：IQ3_S dequant 融合进 TC GEMM 内核（Marlin 式，vLLM 提取线
+  格式不通需自写；dequant 数学须逐位对齐 convert.cu——q4 布局审计的教训适用）。
+  这是多日内核工程，等待决策。
+
 ## 后续路线（按价值）
 
 1. 移植 dual-v100 fork 的 matched-allreduce overlay（+3-4%）
