@@ -305,7 +305,18 @@ static bool sm70_d256_decode_enabled() {
 // decode is latency-bound, a modest second wave hides tail imbalance), hard
 // cap 32. The allocator sizes partials at this cap; the launcher may use less.
 static int sm70_d256_dec_split_cap(int hkv) {
-    return std::min(32, std::max(1, 96 / std::max(hkv, 1)));
+    // (sm70) Depth sweep found the marginal KV scan at ~150GB/s aggregate (9% of
+    // the NVLink+HBM pool): 96 CTAs = 1 4-warp CTA per SM, 25% occupancy, each
+    // serially walking 7k+ key tiles at 174k. More splits = more CTAs = shorter
+    // loops = better latency hiding. Env override sweeps the CTA budget;
+    // default keeps the validated 96-CTA shape.
+    static const int env_cap = [] {
+        const char * e = getenv("LLAMA_SM70_D256_SPLITS");
+        return e ? atoi(e) : 0;
+    }();
+    if (env_cap > 0) { return std::min(env_cap, 256); }
+    (void) hkv;
+    return 48;
 }
 // q4-direct for decode: in-kernel q4_0 loads, no f16 mirror. Default OFF
 // until the perf A/B verdict; the mirror costs 2x the K bytes RW per step at
@@ -319,7 +330,14 @@ static bool sm70_d256_dec_q4_direct() {
 }
 
 static int sm70_d256_dec_splits(int kv_len, int hkv) {
-    const int s = std::min((kv_len + 511) / 512, sm70_d256_dec_split_cap(hkv));
+    // Adaptive split count from the clean-GPU2 sweep (GSQ, TP2, spec):
+    //   22k: 24 splits = 90.6, 43 splits = 84.9  (fewer better at shallow-mid)
+    //   100k: 24 = 56.75, 48 = 62.17, 96 = 61.14 (48 best)
+    //   174k: 24 = 37.37, 48 = 43.47, 96 = 43.26 (48 best)
+    // kv_len/920 (the 22k optimum = 24 splits = 920 keys/split) tracks the
+    // shallow regime, 48-way (cap) from ~50k up. The alloc-side cap bounds
+    // whatever the runtime picks, so scratch sizing stays consistent.
+    const int s = std::min(std::max(kv_len / 920, 1), sm70_d256_dec_split_cap(hkv));
     return std::max(s, 1);
 }
 
