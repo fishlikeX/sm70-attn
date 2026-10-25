@@ -131,6 +131,21 @@ prefill：TP2 492-509 tok/s（单卡 ~470）。
   格式不通需自写；dequant 数学须逐位对齐 convert.cu——q4 布局审计的教训适用）。
   这是多日内核工程，等待决策。
 
+## 追加（深夜五）：dequant 内核优化落地 + flaky 崩溃定性
+
+- **dequant 内核 sm70 化**（dequant-sm70.cuh，env LLAMA_SM70_DEQUANT_FAST 默认开）：
+  256 线程 CTA（8 超块/CTA）、smem 表缓冲（iq3s 2KB/iq3xxs 256B/iq4nl 16B）、u32 向量
+  查表、16B 向量存储。**逐位一致验证**：随机块字节 6 配置（iq3_s/iq3_xxs/iq4_xs ×
+  half/float，nb 至 4096+）全部 memcmp 相等；独立 bench：dequant 本身 2-4×。
+- **真机 prefill A/B 被一个 flaky 崩溃阻断**：c=229376 下第一轮 prefill 中
+  `cublasGemmEx not supported` / meta 断言等混合症状，**消融证明与 dequant-fast 无关**
+  （=0 依然崩）——定性为 skinny 侧缓冲/分片部分缓冲/meta 后端在满上下文下的**内存
+  压力竞态**（此前的 bufs[i] 偶发断言同源）。47.27 那次成功可能是幸运抽签。
+  复现矩阵：c=32768 双次干净；c=229376 三连崩（不同 env 组合）。根因调查待开：
+  c=229376 下 prepass 分配/meta 分配/图缓冲的时序与压力。
+- **可用状态**：c=32768（32k 上下文内）全栈稳定可跑；c=229376 有 flaky 风险，
+  重启可解（幸运抽签）。
+
 ## 后续路线（按价值）
 
 1. 移植 dual-v100 fork 的 matched-allreduce overlay（+3-4%）

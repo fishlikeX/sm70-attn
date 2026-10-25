@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "dequant-sm70.cuh"
 
 #include <cstdint>
 
@@ -337,15 +338,38 @@ static void dequantize_row_iq2_s_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_iq2_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+
+// (sm70) sm_70-tuned dequant kernels: 256-thread CTAs, shared-memory grid
+// staging, vectorized grid loads/stores. Bit-identical output to the stock
+// kernels (verified over random block bytes, half + float destinations).
+// LLAMA_SM70_DEQUANT_FAST=0 falls back to the stock shapes.
+static bool sm70_dequant_fast() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_SM70_DEQUANT_FAST");
+        return e == nullptr || e[0] != '0';   // default on
+    }();
+    return on;
+}
+
+static int64_t sm70_dequant_ctas(int64_t nb) { return (nb + 7) / 8; }
+
 template<typename dst_t>
 static void dequantize_row_iq3_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (sm70_dequant_fast()) {
+        dequant_sm70::dequant_iq3_xxs_sm70<dst_t><<<sm70_dequant_ctas(nb), 256, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_iq3_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (sm70_dequant_fast()) {
+        dequant_sm70::dequant_iq3_s_sm70<dst_t><<<sm70_dequant_ctas(nb), 256, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_iq3_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -371,6 +395,10 @@ static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t 
 template<typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
+    if (sm70_dequant_fast()) {
+        dequant_sm70::dequant_iq4_xs_sm70<dst_t><<<sm70_dequant_ctas(nb), 256, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
