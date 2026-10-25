@@ -2490,7 +2490,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    ggml_sm70_step_prof & sm70_prof = ggml_sm70_step_prof::get();
+    auto sm70_now = [] { return std::chrono::steady_clock::now(); };
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        const auto t_sub0 = sm70_now();
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
@@ -2498,8 +2501,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return status;
             }
         }
+        if (sm70_prof.on) {
+            sm70_prof.meta_sub_ms += std::chrono::duration<double, std::milli>(sm70_now() - t_sub0).count();
+        }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            const auto t_ar0 = sm70_now();
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
@@ -2517,6 +2524,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
+            }
+            if (sm70_prof.on) {
+                sm70_prof.meta_ar_ms += std::chrono::duration<double, std::milli>(sm70_now() - t_ar0).count();
             }
         }
     }

@@ -32,10 +32,18 @@ struct ggml_sm70_step_prof {
 
     uint64_t n_meta       = 0;
     double   meta_wall_ms = 0;
+    double   meta_sub_ms  = 0;  // sum of per-subgraph compute_async host time
+    double   meta_ar_ms   = 0;  // sum of allreduce host time
+    double   cuda_pre_ms  = 0;  // skinny prepass host time (inside cuda graph_compute)
+    double   cuda_rest_ms = 0;  // graph checks + launch host time
 
     long long t_print = 0;
     bool      primed  = false;
     double    pmeta   = 0;
+    double    psub    = 0;
+    double    par     = 0;
+    double    ppre    = 0;
+    double    prest   = 0;
     uint64_t  pn_meta = 0;
     double    p_d = 0, p_v = 0, p_p = 0;
     uint64_t  pn_d = 0, pn_v = 0, pn_p = 0;
@@ -81,13 +89,14 @@ struct ggml_sm70_step_prof {
         const uint64_t dv = v_n - pn_v;
         fprintf(stderr,
                 "[step-prof/%s] +%.1fs | verify %llu calls %.1fms (%.2f ms/rd) | draft %llu calls %.1fms | "
-                "prefill %llu calls %.1fms | meta %llu calls %.1fms | meta %.3f ms/call\n",
+                "prefill %llu calls %.1fms | meta %llu calls %.1fms (sub %.1f = pre %.1f + rest %.1f, ar %.1f) | %.3f ms/call\n",
                 tag, dt_s,
                 (unsigned long long) dv, v_ms - p_v,
                 dv ? (v_ms - p_v) / (double) dv : 0.0,
                 (unsigned long long)(d_n - pn_d), d_ms - p_d,
                 (unsigned long long)(p_n - pn_p), p_ms - p_p,
                 (unsigned long long)(n_meta - pn_meta), meta_wall_ms - pmeta,
+                meta_sub_ms - psub, cuda_pre_ms - ppre, cuda_rest_ms - prest, meta_ar_ms - par,
                 n_meta > pn_meta ? (meta_wall_ms - pmeta) / (double)(n_meta - pn_meta) : 0.0);
         if (!primed) {
             primed = true;
@@ -96,5 +105,7 @@ struct ggml_sm70_step_prof {
         p_d = d_ms; p_v = v_ms; p_p = p_ms;
         pn_d = d_n; pn_v = v_n; pn_p = p_n;
         pmeta = meta_wall_ms; pn_meta = n_meta;
+        psub = meta_sub_ms; par = meta_ar_ms;
+        ppre = cuda_pre_ms; prest = cuda_rest_ms;
     }
 };

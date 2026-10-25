@@ -5315,10 +5315,29 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (sm70_prof_on) {
         ggml_sm70_step_prof_cuda::get().enter(cuda_ctx->device, cuda_ctx->stream(), cgraph->n_nodes);
     }
+    const auto sm70_t_pre0 = std::chrono::steady_clock::now();
 
     ggml_cuda_q8_skinny_prepass(*cuda_ctx, cgraph);
     ggml_cuda_q4k_skinny_prepass(*cuda_ctx, cgraph);
     ggml_cuda_iq_skinny_prepass(*cuda_ctx, cgraph);
+
+    if (sm70_prof_on) {
+        ggml_sm70_step_prof & sp = ggml_sm70_step_prof::get();
+        sp.cuda_pre_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - sm70_t_pre0).count();
+    }
+    const auto sm70_t_rest0 = std::chrono::steady_clock::now();
+    struct sm70_rest_timer {
+        ggml_sm70_step_prof & sp;
+        std::chrono::steady_clock::time_point t0;
+        bool on;
+        ~sm70_rest_timer() {
+            if (on) {
+                sp.cuda_rest_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+            }
+        }
+    } sm70_rest_g{ggml_sm70_step_prof::get(), sm70_t_rest0, sm70_prof_on};
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
