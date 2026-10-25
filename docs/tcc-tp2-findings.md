@@ -100,6 +100,23 @@ prefill：TP2 492-509 tok/s（单卡 ~470）。
 - 今日 174k 阶梯：15.13 → 24.04 → 26.72 → 33.18 → 34.99 → 37.37 → **43.47（+187%）**。
   116k 等效 ≈ 48-52（dual-v100 参照 43.34 @116k，已反超）。
 
+## 追加（同夜三）：IQ skinny 重打包解锁 — 47.27 tok/s @174k
+
+- **发现**：fork 自带完整的 IQ skinny 基础设施（iq-skinny.cu/.cuh，v100-skinny T2 线）：
+  侧缓冲重打包（IQ3_S +7.3% 字节 ≈ +0.8GB）、f16 网格 LUT（1.5 ops/value 解码）、
+  18.9M 值 1 ulp 验证、mul_mat 路由已接（is_repacked 优先）。**默认关**，且 IQ 类型
+  需要双 env：`LLAMA_SM70_SKINNY=2` + `LLAMA_SM70_IQ_SKINNY=1`（缺一不触发）。
+- **实测**（GSQ，TP2，splits48，ub512，174k）：prefill 437.12 → **467.94（+7%）**；
+  decode 43.47 → **47.27（+8.7%）**；接受率 0.70/mean 3.06（轨迹方差内，无劣化）。
+  同时加速两条路的原因：重打包记录的 LUT 解码（1.5 ops/value）比原 IQ3_S 块的
+  查表+分支+乘法便宜，prefill 的 dequant 内核与 decode 的 GEMV 都吃到。
+- 仅 skinny=2 无 IQ=1：无效果（IQ 类型路由门未开）——双 env 缺一不可。
+- **生产配方更新**：追加两个 env。精度属性：1 ulp（非逐位一致），与 TC decode
+  同一验收标准（harness + 接受率 + 输出质量）。
+- 今日 174k 阶梯：15.13 → 24.04 → 26.72 → 33.18 → 34.99 → 37.37 → 43.47 →
+  **47.27（+212%）**。prefill：470 → **468-467.94**（持平——prefill 与 decode
+  首次同时受益）。
+
 ## 后续路线（按价值）
 
 1. 移植 dual-v100 fork 的 matched-allreduce overlay（+3-4%）
