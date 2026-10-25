@@ -65,6 +65,7 @@
 #include "ggml-cuda/q4k-skinny.cuh"  // port of llama.cpp-v100 v100-1.1.1 (MIT)
 #include "ggml-cuda/iq-skinny.cuh"  // IQ codec family (T2), same lineage
 #include "ggml-cuda/q8-skinny.cuh"
+#include "ggml-cuda/step-prof.h"    // LLAMA_SM70_STEP_PROF decode-round budget probe
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -4008,6 +4009,204 @@ static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_id
     return n >= 2 ? n : 0;
 }
 
+// GDN l2-norm prologue fusion (P1): the q/k chains feeding a gated_delta_net
+// (build_gdn_l2_norm = rms_norm(eps/n) -> scale(1/sqrt(n)), models.h) can be
+// executed inside the recurrent GDN kernel (Prologue template). The reduce was
+// fixed to the 8-lane column segment (verify/prologue_microtest.cu: full warp
+// over-counts ss by cols_per_warp=4, rel err 5e-1; segment reduce is ulp-level,
+// 3.3e-7 vs the rms_norm+scale chain). NOTE: ulp-level, NOT bit-exact -- the
+// summation tree differs from rms_norm_f32's block_reduce, so greedy output can
+// diverge (measured: acceptance 91% -> 66% at 174k). OFF by default; opt in with
+// LLAMA_SM70_GDN_PROLOGUE=1 (A/B above: ON 45.19 tok/s vs OFF 56.77 tok/s).
+// Matches the canonical qwen35/qwen3next GDN layer pattern:
+//   q_rms = RMS_NORM(view(conv_silu));  q_sc = SCALE(q_rms)  [use 1 -> gdn src0]
+//   k_rms = RMS_NORM(view(conv_silu,k));k_sc = SCALE(k_rms)  [use 1 -> gdn src1]
+//   gdn   = GATED_DELTA_NET(q_sc, k_sc, ...) as the very next node
+// [P1] GDN l2-norm prologue fusion: the q_rms/q_sc/k_rms/k_sc chain feeding a
+// gated_delta_net can run inside the recurrent GDN kernel (bit-exact in-kernel
+// l2norm, see verify/sm70_gdn_prologue_bitexact.cu). The graph interleaves the
+// alpha/beta/gate chain between k_sc and the GDN, so the kernels are not one
+// contiguous range: the q_rms node marks the chain as elided, the GDN node
+// launches the fused kernel once its g/beta/state inputs have been computed.
+struct ggml_cuda_sm70_gdn_pending {
+    const ggml_cgraph * graph = nullptr;
+    const ggml_tensor *  elide[6] = {};
+    int                  n_elide = 0;
+    const ggml_tensor *  gdn = nullptr;
+    ggml_cuda_gdn_prologue pro;
+};
+static thread_local ggml_cuda_sm70_gdn_pending g_sm70_gdn_pending;
+
+// match at q_rms; on success records the pending launch (gdn runs later)
+static bool ggml_cuda_match_gdn_prologue(const ggml_cgraph * cgraph, int i) {
+    static const bool enabled = ggml_cuda_env_flag("LLAMA_SM70_GDN_PROLOGUE");
+    if (!enabled || i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    static const bool dbg = ggml_cuda_env_flag("LLAMA_SM70_GDN_PROLOGUE_DBG");
+    static int dbg_n = 0;
+    int i_sc_q_dbg = -1, i_rms_k_dbg = -1, i_sc_k_dbg = -1;
+    auto fail = [&](const char * reason) {
+        if (dbg && dbg_n < 4) {
+            dbg_n++;
+            auto opn = [&](int j) { return j >= 0 && j < cgraph->n_nodes ? ggml_op_name(cgraph->nodes[j]->op) : "-"; };
+            fprintf(stderr, "[gdn-pro-match] %s at %s: [%d %s] [%d %s] [%d %s] [%d %s]\n", reason,
+                    cgraph->nodes[i]->name, i, opn(i), i_sc_q_dbg, opn(i_sc_q_dbg),
+                    i_rms_k_dbg, opn(i_rms_k_dbg), i_sc_k_dbg, opn(i_sc_k_dbg));
+        }
+        return false;
+    };
+
+    auto next_real = [&](int from) {
+        int j = from + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        return j;
+    };
+    const int i_sc_q  = next_real(i);
+    const int i_rms_k = i_sc_q  < cgraph->n_nodes ? next_real(i_sc_q)  : cgraph->n_nodes;
+    const int i_sc_k  = i_rms_k < cgraph->n_nodes ? next_real(i_rms_k) : cgraph->n_nodes;
+    i_sc_q_dbg = i_sc_q; i_rms_k_dbg = i_rms_k; i_sc_k_dbg = i_sc_k;
+    if (i_sc_k >= cgraph->n_nodes) {
+        return fail("chain-end");
+    }
+    const ggml_tensor * q_rms = cgraph->nodes[i];
+    const ggml_tensor * q_sc  = cgraph->nodes[i_sc_q];
+    const ggml_tensor * k_rms = cgraph->nodes[i_rms_k];
+    const ggml_tensor * k_sc  = cgraph->nodes[i_sc_k];
+    if (q_rms->op != GGML_OP_RMS_NORM || q_sc->op != GGML_OP_SCALE ||
+        k_rms->op != GGML_OP_RMS_NORM || k_sc->op != GGML_OP_SCALE) {
+        return fail("op-chain");
+    }
+    if (q_sc->src[0] != q_rms || k_sc->src[0] != k_rms) {
+        return fail("dataflow");
+    }
+    if (!ggml_node_has_n_uses(cgraph, i, 1) || !ggml_node_has_n_uses(cgraph, i_sc_q, 1) ||
+        !ggml_node_has_n_uses(cgraph, i_rms_k, 1) || !ggml_node_has_n_uses(cgraph, i_sc_k, 1)) {
+        return fail("use-count");
+    }
+
+    // the GDN that consumes both scales; the gate/beta/state nodes sit in between
+    int i_gdn = -1;
+    for (int j = i_sc_k + 1; j < cgraph->n_nodes && j <= i_sc_k + 64; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_GATED_DELTA_NET && n->src[0] == q_sc && n->src[1] == k_sc) {
+            i_gdn = j;
+            break;
+        }
+    }
+    if (i_gdn < 0) {
+        return fail("no-gdn");
+    }
+    const ggml_tensor * gdn = cgraph->nodes[i_gdn];
+    if ((gdn->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return fail("gdn-output");
+    }
+
+    const ggml_tensor * q_src = q_rms->src[0];
+    const ggml_tensor * k_src = k_rms->src[0];
+    const ggml_tensor * v     = gdn->src[2];
+    if (v->ne[0] != 128 || q_src->ne[0] != 128 || q_src->ne[2] != v->ne[2] || q_src->ne[3] != v->ne[3] ||
+        k_src->ne[0] != 128 || k_src->ne[2] != v->ne[2] || k_src->ne[3] != v->ne[3]) {
+        return fail("geometry");
+    }
+    const int64_t Hk = q_src->ne[1];
+    const int64_t T  = v->ne[2];
+    if (Hk < 1 || Hk > 64 || T < 1 || T > 8) {
+        return fail("range");
+    }
+    if (q_src->type != GGML_TYPE_F32 || k_src->type != GGML_TYPE_F32 ||
+        q_src->nb[0] != sizeof(float) || k_src->nb[0] != sizeof(float) ||
+        !q_src->data || !k_src->data || !q_rms->buffer || !k_rms->buffer ||
+        ggml_backend_buffer_get_type(q_rms->buffer) != ggml_backend_buffer_get_type(k_rms->buffer)) {
+        return fail("buffer");
+    }
+    // bit-exact in-kernel l2norm (one float4 per lane, 32-wide butterfly) needs a
+    // 32-lane warp and 16B-aligned head rows in the raw views
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 32 ||
+        ((uintptr_t) q_src->data & 15) != 0 || ((uintptr_t) k_src->data & 15) != 0 ||
+        (q_src->nb[1] & 15) != 0 || (q_src->nb[2] & 15) != 0 || (q_src->nb[3] & 15) != 0 ||
+        (k_src->nb[1] & 15) != 0 || (k_src->nb[2] & 15) != 0 || (k_src->nb[3] & 15) != 0) {
+        return fail("alignment");
+    }
+    if (gdn->src[3]->ne[0] != 1) {
+        return fail("kda");
+    }
+    if (ggml_get_op_params_f32(q_sc, 1) != 0.0f || ggml_get_op_params_f32(k_sc, 1) != 0.0f) {
+        return fail("bias");
+    }
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, i_gdn + 1 - i, &i_gdn, 1)) {
+        return fail("mem-range");
+    }
+
+    ggml_cuda_sm70_gdn_pending & p = g_sm70_gdn_pending;
+    p = ggml_cuda_sm70_gdn_pending{}; // one chain in flight; layers are sequential
+    p.graph   = cgraph;
+    p.elide[0] = q_rms;
+    p.elide[1] = q_sc;
+    p.elide[2] = k_rms;
+    p.elide[3] = k_sc;
+    p.n_elide  = 4;
+    p.gdn      = gdn;
+    p.pro.q_raw  = (const float *) q_src->data;
+    p.pro.k_raw  = (const float *) k_src->data;
+    p.pro.sq1    = (int64_t) q_src->nb[1] / (int64_t) sizeof(float);
+    p.pro.sq2    = (int64_t) q_src->nb[2] / (int64_t) sizeof(float);
+    p.pro.sq3    = (int64_t) q_src->nb[3] / (int64_t) sizeof(float);
+    p.pro.sk1    = (int64_t) k_src->nb[1] / (int64_t) sizeof(float);
+    p.pro.sk2    = (int64_t) k_src->nb[2] / (int64_t) sizeof(float);
+    p.pro.sk3    = (int64_t) k_src->nb[3] / (int64_t) sizeof(float);
+    p.pro.eps_q   = ggml_get_op_params_f32(q_rms, 0); // rms_norm got eps/n from build_gdn_l2_norm
+    p.pro.eps_k   = ggml_get_op_params_f32(k_rms, 0);
+    p.pro.scale_q = ggml_get_op_params_f32(q_sc, 0);  // 1/sqrt(n)
+    p.pro.scale_k = ggml_get_op_params_f32(k_sc, 0);
+    return true;
+}
+
+// dispatch hook: skips the elided rms/scale nodes and launches the fused GDN
+static bool ggml_cuda_sm70_gdn_pro_dispatch(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, ggml_tensor * node) {
+    ggml_cuda_sm70_gdn_pending & p = g_sm70_gdn_pending;
+    if (p.graph != cgraph) {
+        p = ggml_cuda_sm70_gdn_pending{};
+        p.graph = cgraph;
+        return ggml_cuda_compute_forward(ctx, node);
+    }
+    for (int k = 0; k < p.n_elide; k++) {
+        if (p.elide[k] == node) {
+            return true; // rms/scale elided into the fused GDN
+        }
+    }
+    if (p.gdn != node) {
+        return ggml_cuda_compute_forward(ctx, node);
+    }
+    int idx = -1;
+    for (int j = 0; j < cgraph->n_nodes; j++) {
+        if (cgraph->nodes[j] == node) { idx = j; break; }
+    }
+    ggml_cuda_gated_delta_net_fused_cache cache;
+    static const bool no_cache = ggml_cuda_env_flag("LLAMA_SM70_GDN_PROLOGUE_NOCACHE");
+    int cache_skip = (idx >= 0 && !no_cache) ? ggml_cuda_try_gdn_cache_fusion(cgraph, idx, cache) : 0;
+    ggml_cuda_op_gated_delta_net_fused(ctx, node, p.pro, cache_skip > 0 ? &cache : nullptr);
+    if (cache_skip > 0) {
+        // the kernel wrote the snapshots into the cache: skip the scatter cpy
+        for (int j = idx + 1; j <= idx + cache_skip && j < cgraph->n_nodes; j++) {
+            if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j]) && p.n_elide < 6 &&
+                cgraph->nodes[j]->op == GGML_OP_CPY) {
+                p.elide[p.n_elide++] = cgraph->nodes[j];
+            }
+        }
+    }
+    static int gdn_pro_n = 0;
+    if (gdn_pro_n++ == 0) {
+        fprintf(stderr, "[gdn-prologue] first fusion: %s (cache %d)\n", node->name, cache_skip);
+    }
+    // keep the elide list: the snapshot cpy (marked above) dispatches AFTER this
+    // node and must still be skipped; the next chain match resets the whole struct
+    p.gdn = nullptr;
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4048,8 +4247,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // q_rms/q_sc/k_rms/k_sc chain: mark for in-kernel l2norm (P1); the fused GDN
+    // itself launches at the GDN node, once the gate/beta/state inputs exist.
+    if (node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_match_gdn_prologue(cgraph, i);
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
-    if (node->op == GGML_OP_GATED_DELTA_NET) {
+    // (a pending l2norm-prologue fusion handles this GDN in the dispatch hook,
+    //  which combines the prologue with the same cache fusion)
+    if (node->op == GGML_OP_GATED_DELTA_NET && g_sm70_gdn_pending.gdn != node) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
@@ -5038,7 +5245,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                bool ok = ggml_cuda_sm70_gdn_pro_dispatch(*cuda_ctx, cgraph, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5104,6 +5311,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    const bool sm70_prof_on = ggml_sm70_step_prof::get().on;
+    if (sm70_prof_on) {
+        ggml_sm70_step_prof_cuda::get().enter(cuda_ctx->device, cuda_ctx->stream(), cgraph->n_nodes);
+    }
+
     ggml_cuda_q8_skinny_prepass(*cuda_ctx, cgraph);
     ggml_cuda_q4k_skinny_prepass(*cuda_ctx, cgraph);
     ggml_cuda_iq_skinny_prepass(*cuda_ctx, cgraph);
@@ -5162,6 +5374,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (sm70_prof_on) {
+        ggml_sm70_step_prof_cuda::get().exit(cuda_ctx->device, cuda_ctx->stream());
+    }
 
     return GGML_STATUS_SUCCESS;
 }

@@ -15,7 +15,10 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1835,6 +1838,49 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // [step-prof/ctx] host wall of each llama_context::decode call (draft passes
+    // and verify rounds separate by duration; prefill ubatches are >=100ms)
+    struct sm70_ctx_prof {
+        std::chrono::steady_clock::time_point t0;
+        static bool on() {
+            static bool v = [] {
+                const char * e = getenv("LLAMA_SM70_STEP_PROF");
+                const bool on = e && e[0] == '1';
+                if (on) {
+                    setvbuf(stderr, nullptr, _IONBF, 0); // MSVC block-buffers redirected stderr
+                }
+                return on;
+            }();
+            return v;
+        }
+        sm70_ctx_prof() {
+            if (on()) {
+                t0 = std::chrono::steady_clock::now();
+            }
+        }
+        ~sm70_ctx_prof() {
+            if (!on()) {
+                return;
+            }
+            static uint64_t n = 0, pn = 0;
+            static double ms = 0, pms = 0;
+            static std::chrono::steady_clock::time_point pt{};
+            const double d = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+            ms += d;
+            if (++n % 32 == 0) {
+                const double dt = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - pt).count();
+                fprintf(stderr, "[step-prof/ctx] +%.1fs | decode %llu calls %.1fms (%.2f ms/call)\n",
+                        pt.time_since_epoch().count() ? dt : 0.0,
+                        (unsigned long long)(n - pn), ms - pms, (ms - pms) / (double)(n - pn));
+                pt = std::chrono::steady_clock::now();
+                pms = ms;
+                pn = n;
+            }
+        }
+    } sm70_ctx_prof_g;
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

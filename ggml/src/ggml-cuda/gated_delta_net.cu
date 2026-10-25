@@ -104,16 +104,33 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (Prologue) {
-            // l2 norm the raw q/k, matching the rms_norm + scale ops
+            // l2 norm the raw q/k, matching the rms_norm + scale ops bit-for-bit.
+            // rms_norm_f32 for ncols=128 launches RMS_NORM_LAUNCH(32,1,true): 32
+            // threads, one float4 each in the order x^2+y^2+z^2+w^2, then a 32-wide
+            // shfl_xor butterfly (16,8,4,2,1). Reproducing exactly that tree needs
+            // one float4 of the row per lane -- a per-lane strided sum + segment
+            // reduce lands within ulps but not bitwise (greedy output diverges at
+            // long context: acceptance 91% -> 66% measured). Verified bit-exact by
+            // verify/sm70_gdn_prologue_bitexact.cu (0 of 16384 elements differ).
             float q_ss = 0.0f;
             float k_ss = 0.0f;
+            if constexpr (warp_size == 32 && cols_per_warp == 4) {
+                const float4 qv = reinterpret_cast<const float4 *>(q_t)[lane];
+                const float4 kv = reinterpret_cast<const float4 *>(k_t)[lane];
+                q_ss = qv.x * qv.x + qv.y * qv.y + qv.z * qv.z + qv.w * qv.w;
+                k_ss = kv.x * kv.x + kv.y * kv.y + kv.z * kv.z + kv.w * kv.w;
+                q_ss = warp_reduce_sum<warp_size>(q_ss);
+                k_ss = warp_reduce_sum<warp_size>(k_ss);
+            } else {
+                // non-CUDA warp shapes: ulp-level approx (matcher refuses those archs)
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                q_ss += q_reg[r] * q_reg[r];
-                k_ss += k_reg[r] * k_reg[r];
+                for (int r = 0; r < rows_per_lane; r++) {
+                    q_ss += q_reg[r] * q_reg[r];
+                    k_ss += k_reg[r] * k_reg[r];
+                }
+                q_ss = warp_reduce_sum<lanes_per_col>(q_ss);
+                k_ss = warp_reduce_sum<lanes_per_col>(k_ss);
             }
-            q_ss = warp_reduce_sum<warp_size>(q_ss);
-            k_ss = warp_reduce_sum<warp_size>(k_ss);
 
             const float q_norm = rsqrtf(q_ss / S_v + pro.eps_q);
             const float k_norm = rsqrtf(k_ss / S_v + pro.eps_k);

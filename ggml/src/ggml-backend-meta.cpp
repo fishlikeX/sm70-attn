@@ -4,9 +4,11 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-step-prof.h" // LLAMA_SM70_STEP_PROF decode-round budget probe (host half, CUDA-free)
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -2004,6 +2006,18 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
+    // [step-prof/meta] host wall of the whole meta compute (all subgraphs, all devices)
+    struct sm70_meta_prof_guard {
+        ggml_sm70_step_prof & p;
+        std::chrono::steady_clock::time_point t0;
+        sm70_meta_prof_guard() : p(ggml_sm70_step_prof::get()), t0(std::chrono::steady_clock::now()) {}
+        ~sm70_meta_prof_guard() {
+            if (p.on) {
+                p.meta_wall_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                p.meta_exit();
+            }
+        }
+    } sm70_meta_prof_g;
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
