@@ -74,10 +74,14 @@ static __global__ void ggml_cuda_p2p_ar_kernel(const ggml_cuda_p2p_ar_args a) {
 
     const int64_t slot_base = (int64_t) a.slot * a.n_devs * a.stage_stride;
 
-    // 1. push this block's slice into every rank's staging area, our own included, so that the
-    //    reduce below reads one uniform layout.
+    // 1. push this block's slice into the PEERS' staging areas only. Our own slice is
+    //    already in a.src, so staging it into a.stage[rank] as well doubled the local
+    //    traffic (write + read back) for nothing; the reduce below starts from a.src.
     if ((a.contrib_mask >> a.rank) & 1u) {
         for (int j = 0; j < a.n_devs; ++j) {
+            if (j == a.rank) {
+                continue;
+            }
             float4 * dst = a.stage[j] + slot_base + (int64_t) a.rank * a.stage_stride;
             for (int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
                 dst[i] = a.src[i];
@@ -116,9 +120,11 @@ static __global__ void ggml_cuda_p2p_ar_kernel(const ggml_cuda_p2p_ar_args a) {
     //    still loading 16 B at a time (plain volatile would split this into four 4 B loads).
     const float4 * stage = a.stage[a.rank] + slot_base;
     for (int64_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
-        float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        // own contribution first: same addition order as the staged-everywhere version
+        // for the 2-rank case, so the result is bit-identical to it
+        float4 sum = ((a.contrib_mask >> a.rank) & 1u) ? a.src[i] : make_float4(0.f, 0.f, 0.f, 0.f);
         for (int j = 0; j < a.n_devs; ++j) {
-            if (((a.contrib_mask >> j) & 1u) == 0) {
+            if (j == a.rank || ((a.contrib_mask >> j) & 1u) == 0) {
                 continue;
             }
             const float4 v = __ldcg(stage + (int64_t) j * a.stage_stride + i);
