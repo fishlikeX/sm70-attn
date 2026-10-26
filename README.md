@@ -37,6 +37,10 @@ tensor-core 实现。本仓库把一颗经过 1CatAI 验证的 Split-D N32 D256 
 - **注意力输出全链路 f32**：不再经 f16 暂存，单层舍入减半；
 - **q4_0 核内直读**（opt-in）：XQA 风格的按 dtype 模板加载，把原始 block
   直接解到 MMA 寄存器 fragment，省掉 f16 mirror。
+- **q8_0 核内直读**（opt-in，PR #3）：同一套模板架构支持 q8_0 K/V，与 staged
+  f16 mirror **逐位一致**（本机 22k 与 174k 实测，top-3 logprob 到 9 位小数
+  完全相同）。默认关闭：本机 mirror 只占 0.94 GB/卡（229k），而 direct 在 174k
+  慢约 9%；它是给镜像放不下的权重组合准备的。
 
 **解码**
 - **D256 张量核心解码 kernel**：面向投机验证宽度（w≥2），带核内 q4_0 载入和
@@ -223,6 +227,7 @@ LLAMA_SM70_D256_DEC_Q4=1 \
 | `LLAMA_SM70_SPLITKV3_MIN_KV` | `2048` | SplitKV3 启用阈值（kv_len）；`0` 关闭 |
 | `LLAMA_SM70_D256_Q4_DIRECT` | `0` | 核内 q4_0 直读（省 f16 K/V mirror）：省显存，预填充慢约 4% |
 | `LLAMA_SM70_D256_DECODE` | `0` | D256 张量核心解码 kernel（投机验证宽度 w≥2） |
+| `LLAMA_SM70_D256_Q8_DIRECT` | `0` | q8_0 K/V 按原始 block 核内直读。与 staged mirror 逐位一致（22k / 174k 的 top-3 logprob 都相同），但 174k 预填充慢约 9%（792 vs 871 t/s）：本机 f16 mirror 只占 0.94 GB/卡，所以这个 opt-in 是给显存吃紧的场景。TC 解码 kernel 只吃 f16/q4_0，q8_0 缓存的解码走 stock 路径 |
 | `LLAMA_SM70_D256_DEC_Q4` | `0` | 解码 kernel 的 q4_0 直读 |
 | `LLAMA_SM70_D256_SPLITS` | `0` | 解码 KV 切分上限覆盖（`0` = 自动 `kv_len/920`，上限 48；最大 256） |
 | `LLAMA_SM70_DEQUANT_FAST` | `1` | sm_70 iq3_s/iq3_xxs/iq4_xs 去量化 kernel；`0` = stock 去量化 |

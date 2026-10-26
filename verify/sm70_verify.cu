@@ -83,6 +83,34 @@ static float deq_q4_one(const uint8_t * row_base, int d) {
     return __half2float(__float2half_rn(((float) q - 8.0f) * __half2float(s)));
 }
 
+// ---------------------------------------------------------------------------
+// q8_0 helpers (10/22 q8-direct gate): ggml reference quantizer + kernel-parity
+// dequant. Block: [f16 scale 2B][32 x int8 quants 32B]; row = 8 blocks = 272B.
+// ---------------------------------------------------------------------------
+static void quant_row_q8_0(const float * x, uint8_t * y, int k) {
+    for (int i = 0; i < k / 32; ++i) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) { amax = std::max(amax, fabsf(x[i * 32 + j])); }
+        const float d = amax / 127.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        const __half dh = __float2half(d);
+        memcpy(y + i * 34, &dh, 2);
+        for (int j = 0; j < 32; ++j) {
+            const int q = std::max(-127, std::min(127, (int) roundf(x[i * 32 + j] * id)));
+            y[i * 34 + 2 + j] = (uint8_t) (int8_t) q;
+        }
+    }
+}
+
+// exact f32 product + one RN to half — the in-kernel sm70_q8_dequant_* formula
+static float deq_q8_one(const uint8_t * row_base, int d) {
+    const uint8_t * b = row_base + (d >> 5) * 34;
+    __half s;
+    memcpy(&s, b, 2);
+    const int8_t q = (int8_t) b[2 + (d & 31)];
+    return __half2float(__float2half_rn((float) q * __half2float(s)));
+}
+
 // CPU f32 reference for ONE (batch, q-head, q-row): dot with each kv col,
 // online-softmax-safe (scale in raw space, exp2 parity with kernel).
 static std::vector<float> ref_row(const float* q_row, const float* k, const float* v,
@@ -119,7 +147,9 @@ struct Case { const char* name; int nb, kvlen, q_len; bool sample;
               bool k_posmajor = false;  // true = production to_fp16 dequant K layout (pos-major, 8/23 fix)
               bool splitkv3 = false;    // true = 3-way KV split + merge path (8/23 port; implies f32out)
               bool k_q4 = false;        // true = raw q4_0 K cache, in-kernel dequant (8/23 q4-direct)
-              bool v_q4 = false; };     // true = raw q4_0 V cache, in-kernel dequant
+              bool v_q4 = false;      // true = raw q4_0 V cache, in-kernel dequant
+              bool k_q8 = false;      // true = raw q8_0 K cache, in-kernel dequant (10/22)
+              bool v_q8 = false; };   // true = raw q8_0 V cache, in-kernel dequant
 
 static int run_case(const Case& tc, bool oob) {
     const int nb = tc.nb, kvlen = tc.kvlen, q_len = tc.q_len;
@@ -248,18 +278,59 @@ static int run_case(const Case& tc, bool oob) {
                 }
     }
 
+    // q8_0 caches (k_q8/v_q8): same [b][ctx][hkv][8 blocks x 34B] geometry as
+    // the q4 caches above, quantized with the ggml reference quantizer; the CPU
+    // reference is re-based on the dequantized (one-RN) values.
+    std::vector<uint8_t> Kq8b, Vq8b;
+    if (tc.k_q8) {
+        Kq8b.assign((size_t) nb * kv_alloc_rows * hkv * 272, 0);
+        for (int b = 0; b < nb; ++b)
+            for (int c = 0; c < kvlen; ++c)
+                for (int j = 0; j < hkv; ++j)
+                    quant_row_q8_0(&Kf[(((size_t) (b * hkv + j) * kvlen + c) * D)],
+                                   &Kq8b[(((size_t) (b * kv_alloc_rows + c) * hkv + j) * 272)], D);
+        for (size_t i = 0; i < Kqf.size(); ++i) Kqf[i] = 0.0f;
+        for (int b = 0; b < nb; ++b)
+            for (int c = 0; c < kvlen; ++c)
+                for (int j = 0; j < hkv; ++j) {
+                    const uint8_t * row = &Kq8b[(((size_t) (b * kv_alloc_rows + c) * hkv + j) * 272)];
+                    for (int d = 0; d < D; ++d)
+                        Kqf[(((size_t) (b * hkv + j) * kvlen + c) * D) + d] = deq_q8_one(row, d);
+                }
+    }
+    if (tc.v_q8) {
+        Vq8b.assign((size_t) nb * kv_alloc_rows * hkv * 272, 0);
+        for (int b = 0; b < nb; ++b)
+            for (int c = 0; c < kvlen; ++c)
+                for (int j = 0; j < hkv; ++j)
+                    quant_row_q8_0(&Vf[(((size_t) (b * hkv + j) * kvlen + c) * D)],
+                                   &Vq8b[(((size_t) (b * kv_alloc_rows + c) * hkv + j) * 272)], D);
+        for (size_t i = 0; i < Vqf.size(); ++i) Vqf[i] = 0.0f;
+        for (int b = 0; b < nb; ++b)
+            for (int c = 0; c < kvlen; ++c)
+                for (int j = 0; j < hkv; ++j) {
+                    const uint8_t * row = &Vq8b[(((size_t) (b * kv_alloc_rows + c) * hkv + j) * 272)];
+                    for (int d = 0; d < D; ++d)
+                        Vqf[(((size_t) (b * hkv + j) * kvlen + c) * D) + d] = deq_q8_one(row, d);
+                }
+    }
+
     void *dQ, *dK, *dV, *dO;
     // kernel writes O at [batch][row][head][d] with batch stride = q_pad*heads_q*D
     // (kernel lines 841-844; scatter kernel reads the same layout)
     CK(cudaMalloc(&dQ, Qh.size() * sizeof(El)));
-    CK(cudaMalloc(&dK, tc.k_q4 ? Kq4b.size() : Kh.size() * sizeof(El)));
-    CK(cudaMalloc(&dV, tc.v_q4 ? Vq4b.size() : Vh.size() * sizeof(El)));
+    const void * k_host = tc.k_q8 ? (const void *) Kq8b.data()
+                        : tc.k_q4 ? (const void *) Kq4b.data() : (const void *) Kh.data();
+    const size_t k_bytes = tc.k_q8 ? Kq8b.size() : tc.k_q4 ? Kq4b.size() : Kh.size() * sizeof(El);
+    const void * v_host = tc.v_q8 ? (const void *) Vq8b.data()
+                        : tc.v_q4 ? (const void *) Vq4b.data() : (const void *) Vh.data();
+    const size_t v_bytes = tc.v_q8 ? Vq8b.size() : tc.v_q4 ? Vq4b.size() : Vh.size() * sizeof(El);
+    CK(cudaMalloc(&dK, k_bytes));
+    CK(cudaMalloc(&dV, v_bytes));
     CK(cudaMalloc(&dO, (size_t) nb * q_pad * heads_q * D * (tc.f32out ? sizeof(float) : sizeof(El))));
     CK(cudaMemcpy(dQ, Qh.data(), Qh.size() * sizeof(El), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dK, tc.k_q4 ? (const void*) Kq4b.data() : (const void*) Kh.data(),
-                  tc.k_q4 ? Kq4b.size() : Kh.size() * sizeof(El), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dV, tc.v_q4 ? (const void*) Vq4b.data() : (const void*) Vh.data(),
-                  tc.v_q4 ? Vq4b.size() : Vh.size() * sizeof(El), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dK, k_host, k_bytes, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dV, v_host, v_bytes, cudaMemcpyHostToDevice));
     auto kernel     = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false>;
     auto kernel_f32 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float>;
     auto kernel_s3  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true>;
@@ -268,11 +339,17 @@ static int run_case(const Case& tc, bool oob) {
     auto kernel_q4v   = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, true>;
     auto kernel_q4kv  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  true>;
     auto kernel_s3q4k = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true,  true,  false>;
+    // q8-direct instantiations (10/22): K / V / K+V, dense and SplitKV3.
+    auto kernel_q8k   = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, true,  false>;
+    auto kernel_q8v   = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, false, true>;
+    auto kernel_q8kv  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, true,  true>;
+    auto kernel_s3q8k = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true,  false, false, true,  false>;
     static bool smem_raised = false;
     if (!smem_raised) {
         for (const void* kfn : {(const void*) kernel, (const void*) kernel_f32, (const void*) kernel_s3,
                                 (const void*) kernel_q4k, (const void*) kernel_q4v, (const void*) kernel_q4kv,
-                                (const void*) kernel_s3q4k}) {
+                                (const void*) kernel_s3q4k, (const void*) kernel_q8k, (const void*) kernel_q8v,
+                                (const void*) kernel_q8kv, (const void*) kernel_s3q8k}) {
             CK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
         }
         smem_raised = true;
@@ -317,6 +394,9 @@ static int run_case(const Case& tc, bool oob) {
     // K->nb[1]/K->nb[2] when K->type == GGML_TYPE_Q4_0.
     if (tc.k_q4) { k_row_stride = hkv * 144; k_head_stride = 144; }
     if (tc.v_q4) { v_row_stride = hkv * 144; v_head_stride = 144; }
+    // q8-direct: same raw geometry, 272B rows (8 blocks x 34B)
+    if (tc.k_q8) { k_row_stride = hkv * 272; k_head_stride = 272; }
+    if (tc.v_q8) { v_row_stride = hkv * 272; v_head_stride = 272; }
 
     if (tc.splitkv3) {
         // SplitKV3 path: 3-way partial kernel (grid.y = 3) + merge kernel.
@@ -328,13 +408,13 @@ static int run_case(const Case& tc, bool oob) {
         CK(cudaMalloc(&dPmax, (size_t) (3 * rows3) * sizeof(float)));
         CK(cudaMalloc(&dPsum, (size_t) (3 * rows3) * sizeof(float)));
         const dim3 grid3(q_pad / 64, 3, heads_q);
-        const auto kfn = tc.k_q4 ? kernel_s3q4k : kernel_s3;
+        const auto kfn = tc.k_q8 ? kernel_s3q8k : tc.k_q4 ? kernel_s3q4k : kernel_s3;
         kfn<<<grid3, block, Traits::kSmemBytes, 0>>>(
             (const El*) dQ, (const El*) dK, (const El*) dV, (float*) dO,
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
-            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0,
+            q_pad, kvlen, heads_q, hkv, kv_offset, nullptr, scale_log2, nullptr, 0, 0,
             dPout, dPmax, dPsum);
         CK(cudaGetLastError());
         FLASH_NAMESPACE::sm70_d256_splitkv3_merge_kernel
@@ -347,14 +427,16 @@ static int run_case(const Case& tc, bool oob) {
         CK(cudaFree(dPmax));
         CK(cudaFree(dPsum));
     } else if (tc.f32out) {
-        const auto kfn = tc.k_q4 ? (tc.v_q4 ? kernel_q4kv : kernel_q4k)
+        const auto kfn = tc.k_q8 ? (tc.v_q8 ? kernel_q8kv : kernel_q8k)
+                       : tc.v_q8 ? kernel_q8v
+                       : tc.k_q4 ? (tc.v_q4 ? kernel_q4kv : kernel_q4k)
                                  : (tc.v_q4 ? kernel_q4v : kernel_f32);
         kfn<<<grid, block, Traits::kSmemBytes, 0>>>(
             (const El*) dQ, (const El*) dK, (const El*) dV, (float*) dO,
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
-            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0,
+            q_pad, kvlen, heads_q, hkv, kv_offset, nullptr, scale_log2, nullptr, 0, 0,
             nullptr, nullptr, nullptr);
     } else {
         kernel<<<grid, block, Traits::kSmemBytes, 0>>>(
@@ -362,7 +444,7 @@ static int run_case(const Case& tc, bool oob) {
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
-            q_pad, kvlen, heads_q, hkv, kv_offset, scale_log2, nullptr, 0, 0,
+            q_pad, kvlen, heads_q, hkv, kv_offset, nullptr, scale_log2, nullptr, 0, 0,
             nullptr, nullptr, nullptr);
     }
     CK(cudaGetLastError());
@@ -488,6 +570,13 @@ int main(int argc, char** argv) {
         { "q4KV-279",   1, 279, 279, false, false, true, 1.0f, false, false, true,  true  },
         { "q4KV-3000",  1, 3000, 3000, true,  false, true, 1.0f, false, false, true,  true  },
         { "q4K-s3",     1, 600, 279, false, false, true, 1.0f, false, true,  true,  false },
+        // 10/22 q8-direct port (PR #3): raw q8_0 K/V caches read in-kernel.
+        // q8K-pV = production-like mixed geometry (-ctk q8_0 -ctv f16),
+        // q8KV = both quantized, q8K-s3 = q8-direct + 3-way split + merge.
+        { "q8K-pV",     1, 279, 279, false, true,  true, 1.0f, false, false, false, false, true,  false },
+        { "q8KV-279",   1, 279, 279, false, false, true, 1.0f, false, false, false, false, true,  true  },
+        { "q8KV-3000",  1, 3000, 3000, true,  false, true, 1.0f, false, false, false, false, true,  true  },
+        { "q8K-s3",     1, 600, 279, false, false, true, 1.0f, false, true,  false, false, true,  false },
     };
     static const Case big[] = {
         { "full-32k",    1, 32768, 32768, true },
