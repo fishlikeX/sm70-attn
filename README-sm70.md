@@ -133,6 +133,42 @@ Single-card decode mirrors the TP2 caveat: at 22k the tuned/stock pair is
 inside the MTP-acceptance noise (−7.9%; the greedy texts diverge), but from 46k
 on the KV-split decode kernel pays off clearly (+27% @46k/100k, +32% @174k).
 
+### Concurrency-first variant: 4 x 256k on the same two cards
+
+The skinny weight layouts (`LLAMA_SM70_SKINNY=2` + `LLAMA_SM70_IQ_SKINNY=1`)
+buy **prefill only**. With them off, the same prompts measure 1554 -> 1498 t/s
+at 22k (-3.6%) and 877 -> 841 t/s at 174k (-4%), while **decode is unchanged**
+(no-speculation A/B, so draft acceptance cannot skew it: 23.4 vs 23.3 t/s at
+174k, 40.5 vs 40.1 at 22k). The "+8.7% decode" once attributed to the IQ
+repack was an acceptance effect: the repacked layout changes the logits
+slightly, so MTP verifies a different number of drafts.
+
+What the layouts do cost is VRAM: in the same 22k instance, 22,821 -> 16,904
+MiB per card (-5.9 GB), of which 4.9 GB is the weight copies themselves (fixed
+cost at `-c 8192`: 13,075 -> 8,151 MiB). That is more than the 4.15 GB/card a
+fourth 256k slot needs, which makes this the configuration to use when
+concurrency matters more than the last 4% of prefill:
+
+| config | prefill 22k | prefill 174k | 256k slots that fit |
+|---|---:|---:|---|
+| production (skinny on) | 1554 t/s | 877 t/s | 3 (31,126 MiB/card; 4 OOMs) |
+| concurrency-first (skinny off) | 1498 t/s | 841 t/s | **4 (30,314 MiB/card)** |
+
+```bash
+# 4 x 256k: leave both skinny knobs at their default (0)
+CUDA_VISIBLE_DEVICES=0,1 \
+LLAMA_SM70_D256=1 LLAMA_SM70_D256_DECODE=1 LLAMA_SM70_D256_DEC_Q4=1 \
+./build/bin/llama-server -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
+    -sm tensor -ngl 99 -fit off -c 1048576 -b 4096 -ub 8192 \
+    -fa on -ctk q4_0 -ctv q4_0 \
+    --spec-type draft-mtp --spec-draft-n-max 3 -np 4
+```
+
+Two details worth knowing: `LLAMA_SM70_IQ_SKINNY=1` does nothing on its own,
+because IQ repacking is gated on `LLAMA_SM70_SKINNY != 0` (`iq-skinny.cu`); and
+the middle setting `SKINNY=1 + IQ_SKINNY=1` (k-quants repacked in place, no
+second copy) measured 20,722 MiB/card with 854 t/s at 174k.
+
 ### The 8/26 single-card A/B (historical)
 
 The previous README's headline was measured on a different stack (Q4_K_XL,
@@ -207,8 +243,8 @@ llama.cpp native path automatically — no config needed.
 | `LLAMA_SM70_D256_DEC_Q4` | `0` | q4_0 direct loads in the decode kernel |
 | `LLAMA_SM70_D256_SPLITS` | `0` | Decode KV-split cap override (`0` = auto `kv_len/920`, cap 48; max 256) |
 | `LLAMA_SM70_DEQUANT_FAST` | `1` | sm_70 iq3_s/iq3_xxs/iq4_xs dequant kernels; `0` = stock dequant |
-| `LLAMA_SM70_SKINNY` | `0` | q4_K skinny path: `1` = +10% pp / −28% tg, `2` = +9% pp + full decode but a second weight copy in VRAM |
-| `LLAMA_SM70_IQ_SKINNY` | `0` | IQ skinny repack (+8.7% decode, +7% prefill @174k; large VRAM cost) |
+| `LLAMA_SM70_SKINNY` | `0` | q4_K skinny path: `1` = in-place repack (no copy), `2` = second weight copy (+1.1 GB/card here). Also the gate for `IQ_SKINNY`. See "Concurrency-first variant" for the measured trade |
+| `LLAMA_SM70_IQ_SKINNY` | `0` | IQ repack: +4% prefill @174k, **no decode change**, +3.8 GB/card of side buffers. Only takes effect when `LLAMA_SM70_SKINNY != 0` |
 | `LLAMA_SM70_D256_DEBUG` | `0` | Print kernel selection probes (ACCEPT/REJECT + reason) |
 | `GGML_CUDA_P2P_AR_MAX_BYTES` | `176 MiB` | One-shot P2P allreduce message window; `0` disables that path |
 | `GGML_CUDA_P2P_AR_NBLOCKS` | `80` | Allreduce blocks (≤ one per SM; more deadlocks) |

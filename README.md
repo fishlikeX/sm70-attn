@@ -124,6 +124,38 @@ TP2 相对单卡：预填充 **+52% @22k、+49% @174k**。
 （−7.9%，贪心文本已经分叉），但从 46k 起 KV 切分解码 kernel 明显起作用
 （46k/100k +27%，174k +32%）。
 
+### 并发优先变体：同样两张卡上 4 × 256k
+
+两个瘦身布局（`LLAMA_SM70_SKINNY=2` + `LLAMA_SM70_IQ_SKINNY=1`）**只买预填充**：
+关掉后同一组 prompt 实测 22k 1554 → 1498 t/s（−3.6%）、174k 877 → 841 t/s
+（−4%），而**解码不变**（关掉投机的 A/B，排除草稿接受率干扰：174k 23.4 vs
+23.3 t/s，22k 40.5 vs 40.1）。此前记在 IQ 重排头上的"+8.7% 解码"是接受率
+效应——重排会让 logits 有极小差异，MTP 验证的草稿数随之不同。
+
+它们真正花的是显存：同一个 22k 实例里每卡 22,821 → 16,904 MiB（−5.9 GB），
+其中 4.9 GB 是权重拷贝本身（`-c 8192` 固定开销 13,075 → 8,151 MiB）。这个
+量比第 4 路 256k 需要的 4.15 GB/卡还多，所以当并发比最后 4% 预填充更重要时
+就该用这套：
+
+| 配置 | 预填充 22k | 预填充 174k | 能塞几个 256k 槽 |
+|---|---:|---:|---|
+| 生产（瘦身全开） | 1554 t/s | 877 t/s | 3（31,126 MiB/卡；4 路 OOM） |
+| 并发优先（瘦身全关） | 1498 t/s | 841 t/s | **4（30,314 MiB/卡）** |
+
+```bash
+# 4 × 256k：两个瘦身开关都保持默认（0）
+CUDA_VISIBLE_DEVICES=0,1 \
+LLAMA_SM70_D256=1 LLAMA_SM70_D256_DECODE=1 LLAMA_SM70_D256_DEC_Q4=1 \
+./build/bin/llama-server -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
+    -sm tensor -ngl 99 -fit off -c 1048576 -b 4096 -ub 8192 \
+    -fa on -ctk q4_0 -ctv q4_0 \
+    --spec-type draft-mtp --spec-draft-n-max 3 -np 4
+```
+
+两个容易踩的细节：`LLAMA_SM70_IQ_SKINNY=1` 单独开是**无效**的，IQ 重排的前提是
+`LLAMA_SM70_SKINNY != 0`（`iq-skinny.cu`）；中间档 `SKINNY=1 + IQ_SKINNY=1`
+（k-quant 原地重排、不复制第二份）实测 20,722 MiB/卡，174k 854 t/s。
+
 ### 8/26 的单卡 A/B（历史）
 
 上一版 README 的头牌数字来自另一套栈（Q4_K_XL、`-ctv f16`、`-ub 512`、无 TP2）：
@@ -194,8 +226,8 @@ LLAMA_SM70_D256_DEC_Q4=1 \
 | `LLAMA_SM70_D256_DEC_Q4` | `0` | 解码 kernel 的 q4_0 直读 |
 | `LLAMA_SM70_D256_SPLITS` | `0` | 解码 KV 切分上限覆盖（`0` = 自动 `kv_len/920`，上限 48；最大 256） |
 | `LLAMA_SM70_DEQUANT_FAST` | `1` | sm_70 iq3_s/iq3_xxs/iq4_xs 去量化 kernel；`0` = stock 去量化 |
-| `LLAMA_SM70_SKINNY` | `0` | q4_K 瘦身路径：`1` = 预填充 +10% / 解码 −28%；`2` = 预填充 +9% 且解码不降，但显存里多一整份量化权重 |
-| `LLAMA_SM70_IQ_SKINNY` | `0` | IQ 瘦身重排（174k 解码 +8.7%、预填充 +7%；显存代价大） |
+| `LLAMA_SM70_SKINNY` | `0` | q4_K 瘦身路径：`1` = 原地重排（不复制），`2` = 多一整份权重拷贝（本机 +1.1 GB/卡）。同时是 `IQ_SKINNY` 的开关前提。实测代价见「并发优先变体」 |
+| `LLAMA_SM70_IQ_SKINNY` | `0` | IQ 重排：174k 预填充 +4%、**解码不变**、side buffer +3.8 GB/卡。仅在 `LLAMA_SM70_SKINNY != 0` 时生效 |
 | `LLAMA_SM70_D256_DEBUG` | `0` | 打印 kernel 选择探针（ACCEPT/REJECT + 原因） |
 | `GGML_CUDA_P2P_AR_MAX_BYTES` | `176 MiB` | 单发 P2P allreduce 的消息窗口；`0` 关闭该路径 |
 | `GGML_CUDA_P2P_AR_NBLOCKS` | `80` | allreduce block 数（≤ 每 SM 一个，超了会死锁） |
