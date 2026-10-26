@@ -184,19 +184,23 @@ static bool sm70_q4_direct() {
     return enabled;
 }
 
-// q8-direct (10/22): same architecture as q4-direct for q8_0 blocks
-// (34 B = f16 scale + 32 int8; 8 blocks per 256-d row). DEFAULT ON — the
-// staged fallback mirrors the FULL cache to f16 (V alone = 32 KiB/token),
-// which OOMs the 32 GB card well before the 160k target context, so direct
-// is the only production-viable route. Kernel rounding is bit-identical to
-// the staged dequant (exact f32 product + one RN; same proof as q4, see
-// fattn-sm70-d256-kernel.cuh). Set LLAMA_SM70_D256_Q8_DIRECT=0 to force the
-// staged path (small-ctx A/B correctness testing only — mirror OOMs at
-// production context sizes).
+// q8-direct (10/22, PR #3): same architecture as q4-direct for q8_0 blocks
+// (34 B = f16 scale + 32 int8; 8 blocks per 256-d row). Kernel rounding is
+// bit-identical to the staged dequant (exact f32 product + one RN; same proof
+// as q4), verified here at 22k and 174k: the top-3 logprobs match to 9
+// decimals between direct and staged.
+//
+// DEFAULT OFF, like q4-direct, because on this box the staged mirror is cheap
+// and direct is slower: at 229k context the f16 mirror costs 0.94 GB/card
+// (ggml-alloc reuses it across the FA nodes) and q8_0 staged prefill measures
+// 871 t/s at 174k vs 792 t/s direct (-9%). The PR's default-ON rationale (the
+// mirror OOMs near 160k) comes from a Q6_K weight set with ~10 GB less
+// headroom; with larger weights or a tighter card, set this to 1 -- that is
+// what the raw-block path is for.
 static bool sm70_q8_direct() {
     static const bool enabled = [] {
         const char * e = getenv("LLAMA_SM70_D256_Q8_DIRECT");
-        return !e || e[0] != '0';
+        return e != nullptr && e[0] == '1';
     }();
     return enabled;
 }
