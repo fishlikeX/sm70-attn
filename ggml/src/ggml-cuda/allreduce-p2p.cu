@@ -7,7 +7,10 @@
 // One block index is the unit of cross-device synchronisation: block b on every rank exchanges
 // the same slice, so a per-block-index barrier is enough and no grid-wide sync is needed.
 // Override the block count with GGML_CUDA_P2P_AR_NBLOCKS.
-#define GGML_CUDA_P2P_AR_NBLOCKS_DEFAULT 16
+// 2026-10-26: the staged kernel is latency-bound at 16 blocks on prefill-sized
+// messages (168 MB): 16 -> 40 -> 80 blocks measured 1472 -> 1514 -> 1544 t/s
+// at 22k, 2x V100. The init clamps to one block per SM, so this is the ceiling.
+#define GGML_CUDA_P2P_AR_NBLOCKS_DEFAULT 80
 #define GGML_CUDA_P2P_AR_NTHREADS        256
 
 // Two staging slots (GGML_CUDA_P2P_AR_NSLOTS), alternating per call. A rank can run at most one call ahead of its peers
