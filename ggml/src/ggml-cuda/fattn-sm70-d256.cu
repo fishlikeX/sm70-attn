@@ -19,7 +19,9 @@
 //     rows are zero and their outputs are never written back by the scatter).
 //   * K/V: read directly from the stock f16 buffers — native f16 cache, or
 //     the stock f16 dequant extra (this launcher runs the same to_fp16
-//     dequant the stock launch_fattn does). No K/V staging: the kernel's
+//     dequant the stock launch_fattn does). q4_0/q8_0 caches dequantize
+//     IN-KERNEL when direct is on (see sm70_q4_direct / sm70_q8_direct).
+//     No K/V staging: the kernel's
 //     causal n_block_max bound + causal mask guarantee no read beyond
 //     kv_len (only the causal diagonal block is read unguarded, and all
 //     its columns are < kv_len), and the f16 buffers are physically
@@ -180,6 +182,32 @@ static bool sm70_q4_direct() {
         return e && e[0] == '1';
     }();
     return enabled;
+}
+
+// q8-direct (10/22): same architecture as q4-direct for q8_0 blocks
+// (34 B = f16 scale + 32 int8; 8 blocks per 256-d row). DEFAULT ON — the
+// staged fallback mirrors the FULL cache to f16 (V alone = 32 KiB/token),
+// which OOMs the 32 GB card well before the 160k target context, so direct
+// is the only production-viable route. Kernel rounding is bit-identical to
+// the staged dequant (exact f32 product + one RN; same proof as q4, see
+// fattn-sm70-d256-kernel.cuh). Set LLAMA_SM70_D256_Q8_DIRECT=0 to force the
+// staged path (small-ctx A/B correctness testing only — mirror OOMs at
+// production context sizes).
+static bool sm70_q8_direct() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_SM70_D256_Q8_DIRECT");
+        return !e || e[0] != '0';
+    }();
+    return enabled;
+}
+
+// Single source of truth for the raw-block direct predicate. Routing,
+// get_alloc_size and the launcher MUST agree, or the launcher derefs a null
+// f16_extra (the two inline copies this replaces were a standing hazard).
+static bool sm70_kv_direct(const ggml_tensor * t) {
+    if (t->type == GGML_TYPE_Q4_0) { return sm70_q4_direct(); }
+    if (t->type == GGML_TYPE_Q8_0) { return sm70_q8_direct(); }
+    return false;
 }
 
 // 8/23 cause hunt: capture the FIRST sm70 invocation's actual kernel inputs
@@ -524,10 +552,13 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
         sm70_d256_probe("REJECT: gqa ratio", cc, Q, K, V, mask);
         return false;
     }
-    // NB (8/23): F32 K/V REJECTED — the launcher only implements F16 (direct)
-    // and Q4_0 (dequant) branches; an F32 tensor would hit GGML_ABORT.
-    const bool kv_ok = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0)
-                    && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0);
+    // NB (8/23): F32 K/V REJECTED — the launcher only implements F16 (direct),
+    // Q4_0 and Q8_0 (in-kernel dequant when direct, staged mirror otherwise)
+    // branches; an F32 tensor would hit GGML_ABORT.
+    const bool kv_ok = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0
+                        || K->type == GGML_TYPE_Q8_0)
+                    && (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0
+                        || V->type == GGML_TYPE_Q8_0);
     if (!kv_ok) {
         sm70_d256_probe("REJECT: kv type", cc, Q, K, V, mask);
         return false;
@@ -556,11 +587,25 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
             return false;
         }
     }
-    sm70_d256_probe(
-        (K->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q4_0) && sm70_q4_direct()
-            ? "ACCEPT: sm70 d256 + q4-direct"
-            : "ACCEPT: sm70 d256 kernel selected",
-        cc, Q, K, V, mask);
+    // q8-direct: same block-contiguity requirement (nb[0] == 34). Without
+    // direct, the staged to_fp16_nc handles any source strides (q8 branch
+    // never addresses raw blocks).
+    if (sm70_q8_direct()) {
+        const size_t q8_blk = ggml_type_size(GGML_TYPE_Q8_0);
+        if ((K->type == GGML_TYPE_Q8_0 && K->nb[0] != q8_blk)
+         || (V->type == GGML_TYPE_Q8_0 && V->nb[0] != q8_blk)) {
+            sm70_d256_probe("REJECT: q8 rows not block-contiguous", cc, Q, K, V, mask);
+            return false;
+        }
+    }
+    const char * accept_reason = "ACCEPT: sm70 d256 kernel selected";
+    if ((K->type == GGML_TYPE_Q8_0 && sm70_kv_direct(K))
+     || (V->type == GGML_TYPE_Q8_0 && sm70_kv_direct(V))) {
+        accept_reason = "ACCEPT: sm70 d256 + q8-direct";
+    } else if (sm70_kv_direct(K) || sm70_kv_direct(V)) {
+        accept_reason = "ACCEPT: sm70 d256 + q4-direct";
+    }
+    sm70_d256_probe(accept_reason, cc, Q, K, V, mask);
     return true;
 }
 
@@ -599,11 +644,11 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
     const ggml_tensor * V = dst->src[2];
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
-    // q4-direct: raw in-kernel reads need no f16 mirror for that tensor.
-    // MUST stay consistent with the launcher's k_direct/v_direct predicate
-    // (same env, same types) or the launcher would deref a null f16_extra.
-    const bool k_direct = K->type == GGML_TYPE_Q4_0 && sm70_q4_direct();
-    const bool v_direct = V->type == GGML_TYPE_Q4_0 && sm70_q4_direct();
+    // q4/q8-direct: raw in-kernel reads need no f16 mirror for that tensor.
+    // MUST stay consistent with the launcher (shared sm70_kv_direct helper)
+    // or the launcher would deref a null f16_extra.
+    const bool k_direct = sm70_kv_direct(K);
+    const bool v_direct = sm70_kv_direct(V);
     const bool need_f16_K = K->type != GGML_TYPE_F16 && !k_direct;
     // MUST match the launcher's need_f16_V exactly (edge case: V is a view of
     // a non-f16 K — the launcher still dequants V, so the alloc must cover it).
@@ -652,8 +697,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     // NOTE (8/19 crash post-mortem): K and V types are legitimately
     // different (-ctk q4_0 -ctv f16): the dequant path handles each
     // independently. Do NOT assert K->type == V->type.
-    GGML_ASSERT(K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0
+                || K->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0
+                || V->type == GGML_TYPE_Q8_0);
 
     const int q_pad = ((q_len + SM70_D256_BLOCK_M - 1) / SM70_D256_BLOCK_M) * SM70_D256_BLOCK_M;
 
@@ -674,10 +721,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     // base = start of the get_alloc_size extra region (right after dst out)
     const char * base = (const char *) dst->data + ggml_nbytes(dst);
 
-    // q4-direct: K/V q4_0 served from the raw block cache in-kernel — no f16
-    // mirror allocation, no dequant pass (alloc_size computed the same way).
-    const bool k_direct = K->type == GGML_TYPE_Q4_0 && sm70_q4_direct();
-    const bool v_direct = V->type == GGML_TYPE_Q4_0 && sm70_q4_direct();
+    // q4/q8-direct: K/V served from the raw block cache in-kernel — no f16
+    // mirror allocation, no dequant pass (alloc_size uses the same helper).
+    const bool k_direct = sm70_kv_direct(K);
+    const bool v_direct = sm70_kv_direct(V);
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst,
@@ -710,9 +757,9 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         k_row_stride   = K->nb[1] / sizeof(half);
         k_head_stride  = K->nb[2] / sizeof(half);
     } else if (k_direct) {
-        // q4-direct: raw block bytes; strides in BYTES ([ctx][head][block]
-        // pos-major: nb[1] = ctx stride, nb[2] = head stride). The Kq4 kernel
-        // branch reinterprets the pointer/strides accordingly.
+        // q4/q8-direct: raw block bytes; strides in BYTES ([ctx][head][block]
+        // pos-major: nb[1] = ctx stride, nb[2] = head stride). The Kq4/Kq8
+        // kernel branch reinterprets the pointer/strides accordingly.
         K_h2 = (const half *) K->data;
         k_row_stride   = K->nb[1];
         k_head_stride  = K->nb[2];
@@ -736,7 +783,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         v_row_stride   = V->nb[1] / sizeof(half);
         v_head_stride  = V->nb[2] / sizeof(half);
     } else if (v_direct) {
-        // q4-direct: raw block bytes, strides in BYTES (see K above).
+        // q4/q8-direct: raw block bytes, strides in BYTES (see K above).
         V_h2 = (const half *) V->data;
         v_row_stride   = V->nb[1];
         v_head_stride  = V->nb[2];
@@ -769,28 +816,58 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     using El = cutlass::half_t;
     // ElOut=float: attention output stays f32 end-to-end (8/23 review — the f16
     // Os staging was the largest sm70-side per-layer rounding source).
-    // 8 instantiations: {dense, SplitKV3} x {staged/f16, Kq4, Vq4, Kq4+Vq4}.
-    auto kernel_00 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false>;
-    auto kernel_10 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  false>;
-    auto kernel_01 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, true>;
-    auto kernel_11 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  true>;
+    // Per-tensor KV mode: 0 = f16 (native cache or staged mirror), 1 = q4_0
+    // in-kernel dequant, 2 = q8_0 in-kernel dequant. Template order
+    // <El, PagedKV, ElOut, SplitKV3, Kq4, Vq4, Kq8, Vq8> -> flags for mode
+    // (i,j) are Kq4=(i==1), Vq4=(j==1), Kq8=(i==2), Vq8=(j==2).
+    // 18 instantiations: {dense, SplitKV3} x {0,1,2}^2.
+    auto kernel_00 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, false, false>;
+    auto kernel_01 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, true,  false, false>;
+    auto kernel_02 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, false, true >;
+    auto kernel_10 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  false, false, false>;
+    auto kernel_11 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  true,  false, false>;
+    auto kernel_12 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  false, false, true >;
+    auto kernel_20 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, true,  false>;
+    auto kernel_21 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, true,  true,  false>;
+    auto kernel_22 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, true,  true >;
     // SplitKV3 (upstream sm70_flash_attn_d256_splitkv3 patch, 8/23 port):
     // 3-way KV split for long-prefix prefill — triples the CTA count so late
     // chunks of a long prefill stop serializing their KV sweep on a saturated
     // SM grid. Env-tunable threshold (default 2048; 0 disables).
-    auto kernel_s3_00 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false>;
-    auto kernel_s3_10 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  false>;
-    auto kernel_s3_01 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, true>;
-    auto kernel_s3_11 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  true>;
+    auto kernel_s3_00 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false, false, false>;
+    auto kernel_s3_01 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, true,  false, false>;
+    auto kernel_s3_02 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false, false, true >;
+    auto kernel_s3_10 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  false, false, false>;
+    auto kernel_s3_11 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  true,  false, false>;
+    auto kernel_s3_12 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  false, false, true >;
+    auto kernel_s3_20 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false, true,  false>;
+    auto kernel_s3_21 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, true,  true,  false>;
+    auto kernel_s3_22 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false, true,  true >;
+    using kernel_fn_t = decltype(kernel_00);
+    const kernel_fn_t kfn_dense[3][3] = {
+        {kernel_00, kernel_01, kernel_02},
+        {kernel_10, kernel_11, kernel_12},
+        {kernel_20, kernel_21, kernel_22},
+    };
+    const kernel_fn_t kfn_s3[3][3] = {
+        {kernel_s3_00, kernel_s3_01, kernel_s3_02},
+        {kernel_s3_10, kernel_s3_11, kernel_s3_12},
+        {kernel_s3_20, kernel_s3_21, kernel_s3_22},
+    };
+    // Mode per tensor: raw-block direct only; a q4/q8 tensor with its direct
+    // env off falls back to the staged f16 mirror (mode 0).
+    const int k_mode = k_direct ? (K->type == GGML_TYPE_Q4_0 ? 1 : 2) : 0;
+    const int v_mode = v_direct ? (V->type == GGML_TYPE_Q4_0 ? 1 : 2) : 0;
 
     static bool smem_raised = false;
     if (!smem_raised) {
-        for (const void * kfn : {(const void *) kernel_00, (const void *) kernel_10,
-                                 (const void *) kernel_01, (const void *) kernel_11,
-                                 (const void *) kernel_s3_00, (const void *) kernel_s3_10,
-                                 (const void *) kernel_s3_01, (const void *) kernel_s3_11}) {
-            CUDA_CHECK(cudaFuncSetAttribute(kfn,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                CUDA_CHECK(cudaFuncSetAttribute((const void *) kfn_dense[i][j],
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
+                CUDA_CHECK(cudaFuncSetAttribute((const void *) kfn_s3[i][j],
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
+            }
         }
         smem_raised = true;
     }
@@ -814,8 +891,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     float * partial_sum = partial_max + 3 * rows3;
 
     if (use_splitkv3) {
-        const auto kfn = k_direct ? (v_direct ? kernel_s3_11 : kernel_s3_10)
-                                  : (v_direct ? kernel_s3_01 : kernel_s3_00);
+        const auto kfn = kfn_s3[k_mode][v_mode];
         kfn<<<grid, block, Traits::kSmemBytes, stream>>>(
                 (const El *) Qs,
                 (const El *) K_h2,
@@ -840,8 +916,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 nullptr, 0, 0,
                 partial_out, partial_max, partial_sum);
     } else {
-        const auto kfn = k_direct ? (v_direct ? kernel_11 : kernel_10)
-                                  : (v_direct ? kernel_01 : kernel_00);
+        const auto kfn = kfn_dense[k_mode][v_mode];
         kfn<<<grid, block, Traits::kSmemBytes, stream>>>(
                 (const El *) Qs,
                 (const El *) K_h2,

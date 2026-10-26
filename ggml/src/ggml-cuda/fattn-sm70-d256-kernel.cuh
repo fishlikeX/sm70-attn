@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 
@@ -486,6 +487,99 @@ __device__ __forceinline__ void sm70_q4_fill_kv(
     }
 }
 
+// ---------------------------------------------------------------------------
+// q8_0 in-kernel dequant (10/22 q8-direct port, same architecture as q4).
+//
+// Block layout: [f16 scale (2B)][32 x int8 quants (32B)] = 34B per 32 dims;
+// 8 blocks x 34B = 272B per 256-d row (routing requires nb[0] == 34).
+// Addressing under Kq8/Vq8: row_base = cache + token*k_row_stride +
+// head*k_head_stride (byte strides, [ctx][head][block] pos-major); element d
+// lives in block (d>>5) at byte 2 + (d&31).
+//
+// Rounding parity with the staged path (ggml-cuda/convert.cu
+// dequantize_block_q8_0): value = q*s with s loaded f16->f32 (exact) and q
+// an exact int8 — the 19-bit product is exact in f32 — rounded once to half.
+// Same one-RN argument as the q4 port, so direct and staged bit-match.
+//
+// Loads stay NATURALLY ALIGNED (the q4 port's discipline): the scale half is
+// at an even offset (34*block + row_base, both even) and the quant bytes are
+// read as u16s at p = b + 2 + (d&31) (even: col is 4-/8-aligned within the
+// block, (d>>5)*34 is even). Direct u32/u64 reads would sit 2-mod-4 on every
+// other block; u16 pairs cost one extra load per group and never misalign.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ __half sm70_q8_dequant_one(
+        const uint8_t * __restrict__ row_base, const int d) {
+    const uint8_t * b = row_base + (d >> 5) * 34;
+    const float s = __half2float(*reinterpret_cast<const __half *>(b));
+    const int8_t q = (int8_t) b[2 + (d & 31)];
+    return __float2half_rn((float) q * s);
+}
+
+// Dequant kGrp (4 or 8) consecutive elements starting at d (4-/8-aligned, so
+// they never straddle a block), mirroring sm70_q4_dequant_group: block+scale
+// addressing derived once per group; quant bytes read as aligned u16 pairs.
+template <int kGrp>
+__device__ __forceinline__ void sm70_q8_dequant_group(
+        const uint8_t * __restrict__ row_base, const int d, __half out[kGrp]) {
+    static_assert(kGrp == 4 || kGrp == 8, "group must be 4 or 8");
+    const uint8_t * b = row_base + (d >> 5) * 34;
+    const float s = __half2float(*reinterpret_cast<const __half *>(b));
+    const uint8_t * p = b + 2 + (d & 31);
+    uint16_t w[kGrp / 2];
+#pragma unroll
+    for (int t = 0; t < kGrp / 2; ++t) {
+        w[t] = *reinterpret_cast<const uint16_t *>(p + 2 * t);
+    }
+#pragma unroll
+    for (int j = 0; j < kGrp; ++j) {
+        const uint16_t word = w[j >> 1];
+        const int8_t q = (j & 1) ? (int8_t) (word >> 8) : (int8_t) (word & 0xFF);
+        out[j] = __float2half_rn((float) q * s);
+    }
+}
+
+// Fill a K/V fragment from the raw q8_0 cache — layout-agnostic twin of
+// sm70_q4_fill_kv (identity-tensor partition, same consecutiveness check and
+// per-element fallback). kGrp = the tiled copy's value-group size (K: 4, V: 8).
+template <int kGrp, typename FragT, typename CoordT>
+__device__ __forceinline__ void sm70_q8_fill_kv(
+        const uint8_t * __restrict__ head_base,
+        const int64_t row_stride,
+        const int token0,
+        const int d_chunk,
+        FragT & frag,
+        const CoordT & coords) {
+    constexpr int kDChunk = Sm70D256SplitDTraits::kDChunk;
+#pragma unroll
+    for (int i = 0; i < size(frag); i += kGrp) {
+        const int row = get<0>(coords(i));
+        const int col = get<1>(coords(i));
+        bool consec = true;
+#pragma unroll
+        for (int j = 1; j < kGrp; ++j) {
+            consec = consec && get<0>(coords(i + j)) == row
+                            && get<1>(coords(i + j)) == col + j;
+        }
+        const uint8_t * row_base = head_base
+            + static_cast<int64_t>(token0 + row) * row_stride;
+        const int d = d_chunk * kDChunk + col;
+        __half tmp[kGrp];
+        if (consec) {
+            sm70_q8_dequant_group<kGrp>(row_base, d, tmp);
+        } else {
+#pragma unroll
+            for (int j = 0; j < kGrp; ++j) {
+                tmp[j] = sm70_q8_dequant_one(row_base, d + j);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kGrp; ++j) {
+            frag(i + j) = tmp[j];
+        }
+    }
+}
+
 template <int kThreadsPerRow, int kRowsPerThread, int kElemsPerLoad>
 __device__ __forceinline__ int64_t paged_kv_thread_offset(
     int tid,
@@ -525,8 +619,14 @@ __device__ __forceinline__ int64_t paged_kv_thread_offset(
 // 4/8-element group (the #268 wide-load idea adapted: no page tables here,
 // so the amortization is block addressing, and nibble pairs are read as
 // aligned u16s). Dense path only (static_assert against PagedKV).
+//
+// Kq8/Vq8 (10/22 q8-direct port): same raw-byte addressing for q8_0 blocks
+// (8 blocks x 34B per 256-d row, byte strides), dequantized in-kernel via
+// sm70_q8_fill_kv — see the q8 dequant block above for layout + rounding.
+// The two flags are mutually exclusive per tensor (K is either q4-direct or
+// q8-direct or f16).
 template <typename Element, bool PagedKV, typename ElementOut = Element, bool SplitKV3 = false,
-          bool Kq4 = false, bool Vq4 = false>
+          bool Kq4 = false, bool Vq4 = false, bool Kq8 = false, bool Vq8 = false>
 __global__ __launch_bounds__(Sm70D256SplitDTraits::kNThreads, 1)
 void sm70_d256_splitd_dense_kernel(
     const Element *__restrict__ q,
@@ -556,8 +656,10 @@ void sm70_d256_splitd_dense_kernel(
     float *__restrict__ partial_max,
     float *__restrict__ partial_sum) {
     using Traits = Sm70D256SplitDTraits;
-    static_assert(!(PagedKV && (Kq4 || Vq4)),
-                  "q4-direct implements the dense (non-paged) path only");
+    static_assert(!(PagedKV && (Kq4 || Vq4 || Kq8 || Vq8)),
+                  "q4/q8-direct implements the dense (non-paged) path only");
+    static_assert(!(Kq4 && Kq8) && !(Vq4 && Vq8),
+                  "a KV tensor is either q4-direct or q8-direct, not both");
     constexpr int kBlockM = Traits::kBlockM;
     constexpr int kBlockN = Traits::kBlockN;
     constexpr int kDChunk = Traits::kDChunk;
@@ -689,15 +791,15 @@ void sm70_d256_splitd_dense_kernel(
         ? 0
         : static_cast<int64_t>(batch)
             * k_outer_stride;
-    // q4-direct: hoisted per-CTA head base (byte pointer). Under Kq4/Vq4 the
-    // k/v args are raw block bytes and the row/head strides are BYTES
-    // ([ctx][head][block]); per-tile addressing reduces to
+    // q4/q8-direct: hoisted per-CTA head base (byte pointer). Under the
+    // direct flags the k/v args are raw block bytes and the row/head strides
+    // are BYTES ([ctx][head][block]); per-tile addressing reduces to
     // head_base + (n_block*kBlockN + row) * row_stride.
-    const uint8_t * k_q4_head_base = Kq4
+    const uint8_t * k_raw_head_base = (Kq4 || Kq8)
         ? reinterpret_cast<const uint8_t *>(k)
               + static_cast<int64_t>(head_kv) * k_head_stride
         : nullptr;
-    const uint8_t * v_q4_head_base = Vq4
+    const uint8_t * v_raw_head_base = (Vq4 || Vq8)
         ? reinterpret_cast<const uint8_t *>(v)
               + static_cast<int64_t>(head_kv) * v_head_stride
         : nullptr;
@@ -715,8 +817,11 @@ void sm70_d256_splitd_dense_kernel(
     // (the tVcV pattern). Drives the q4-direct fills.
     auto cK = make_identity_tensor(Shape<Int<kBlockN>, Int<kDChunk>>{});
     auto tKcK = gmem_k_thread.partition_S(cK);
-    if constexpr (Kq4) {
-        sm70_q4_fill_kv<4>(k_q4_head_base, k_row_stride,
+    if constexpr (Kq8) {
+        sm70_q8_fill_kv<4>(k_raw_head_base, k_row_stride,
+                           n_block_first * kBlockN, 0, tKsK, tKcK);
+    } else if constexpr (Kq4) {
+        sm70_q4_fill_kv<4>(k_raw_head_base, k_row_stride,
                            n_block_first * kBlockN, 0, tKsK, tKcK);
     } else {
         auto gKFirst = local_tile(
@@ -753,8 +858,12 @@ void sm70_d256_splitd_dense_kernel(
 #pragma unroll
         for (int d_chunk = 0; d_chunk < Traits::kDChunks; ++d_chunk) {
             if (d_chunk + 1 < Traits::kDChunks) {
-                if constexpr (Kq4) {
-                    sm70_q4_fill_kv<4>(k_q4_head_base, k_row_stride,
+                if constexpr (Kq8) {
+                    sm70_q8_fill_kv<4>(k_raw_head_base, k_row_stride,
+                                       n_block * kBlockN, d_chunk + 1,
+                                       tKrKNext, tKcK);
+                } else if constexpr (Kq4) {
+                    sm70_q4_fill_kv<4>(k_raw_head_base, k_row_stride,
                                        n_block * kBlockN, d_chunk + 1,
                                        tKrKNext, tKcK);
                 } else {
@@ -844,10 +953,16 @@ void sm70_d256_splitd_dense_kernel(
         auto tVgV2Raw = gmem_v_thread.partition_S(gV2);
         auto tVgV0 = reshape_kv_thread_tensor<PagedKV>(tVgV0Raw);
         auto tVgV2 = reshape_kv_thread_tensor<PagedKV>(tVgV2Raw);
-        if constexpr (Vq4) {
-            sm70_q4_fill_kv<8>(v_q4_head_base, v_row_stride,
+        if constexpr (Vq8) {
+            sm70_q8_fill_kv<8>(v_raw_head_base, v_row_stride,
                                n_block * kBlockN, 0, tVrV0, tVcV);
-            sm70_q4_fill_kv<8>(v_q4_head_base, v_row_stride,
+            sm70_q8_fill_kv<8>(v_raw_head_base, v_row_stride,
+                               n_block * kBlockN, Traits::kOwnedDChunks,
+                               tVrV1, tVcV);
+        } else if constexpr (Vq4) {
+            sm70_q4_fill_kv<8>(v_raw_head_base, v_row_stride,
+                               n_block * kBlockN, 0, tVrV0, tVcV);
+            sm70_q4_fill_kv<8>(v_raw_head_base, v_row_stride,
                                n_block * kBlockN, Traits::kOwnedDChunks,
                                tVrV1, tVcV);
         } else {
@@ -912,10 +1027,16 @@ void sm70_d256_splitd_dense_kernel(
         auto tVgV3Raw = gmem_v_thread.partition_S(gV3);
         auto tVgV1 = reshape_kv_thread_tensor<PagedKV>(tVgV1Raw);
         auto tVgV3 = reshape_kv_thread_tensor<PagedKV>(tVgV3Raw);
-        if constexpr (Vq4) {
-            sm70_q4_fill_kv<8>(v_q4_head_base, v_row_stride,
+        if constexpr (Vq8) {
+            sm70_q8_fill_kv<8>(v_raw_head_base, v_row_stride,
                                n_block * kBlockN, 1, tVrV0, tVcV);
-            sm70_q4_fill_kv<8>(v_q4_head_base, v_row_stride,
+            sm70_q8_fill_kv<8>(v_raw_head_base, v_row_stride,
+                               n_block * kBlockN,
+                               Traits::kOwnedDChunks + 1, tVrV1, tVcV);
+        } else if constexpr (Vq4) {
+            sm70_q4_fill_kv<8>(v_raw_head_base, v_row_stride,
+                               n_block * kBlockN, 1, tVrV0, tVcV);
+            sm70_q4_fill_kv<8>(v_raw_head_base, v_row_stride,
                                n_block * kBlockN,
                                Traits::kOwnedDChunks + 1, tVrV1, tVcV);
         } else {
@@ -976,9 +1097,13 @@ void sm70_d256_splitd_dense_kernel(
                 store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
                 __syncthreads();
                 if (n_block > n_block_min) {
-                    if constexpr (Kq4) {
+                    if constexpr (Kq8) {
+                        sm70_q8_fill_kv<4>(
+                            k_raw_head_base, k_row_stride,
+                            (n_block - 1) * kBlockN, 0, tKrKNext, tKcK);
+                    } else if constexpr (Kq4) {
                         sm70_q4_fill_kv<4>(
-                            k_q4_head_base, k_row_stride,
+                            k_raw_head_base, k_row_stride,
                             (n_block - 1) * kBlockN, 0, tKrKNext, tKcK);
                     } else {
                         auto gKNextBlock = local_tile(
