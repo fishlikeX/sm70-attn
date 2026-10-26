@@ -663,6 +663,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
     GGML_ASSERT(logit_softcap == 0.0f);
     const float softmax_scale_log2 = scale * M_LOG2E;
+    // the kernel derives the causal base from the last query row's live key count
+    // (mask->ne[0] is padded up for tiling, so kv_len - q_len alone is wrong);
+    // the value below is only the fallback for when no mask row is supplied
+    const half * mask_last_q = (const half *) mask->data + (int64_t) (q_len - 1) * mask->ne[0];
     const int kv_offset = kv_len - q_len;
     const int64_t nQ = (int64_t) hkv * gqa * nb * q_pad * SM70_D256_D; // Qs elems (f16); Os same count in f32
 
@@ -831,6 +835,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 hkv * gqa,
                 hkv,
                 kv_offset,
+                mask_last_q,
                 softmax_scale_log2,
                 nullptr, 0, 0,
                 partial_out, partial_max, partial_sum);
@@ -856,6 +861,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 hkv * gqa,   // heads_q
                 hkv,         // heads_kv
                 kv_offset,
+                mask_last_q,
                 softmax_scale_log2,
                 nullptr, 0, 0,
                 nullptr, nullptr, nullptr);

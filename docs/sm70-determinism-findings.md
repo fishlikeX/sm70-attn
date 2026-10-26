@@ -118,7 +118,7 @@ bit pattern, hiding index bugs). Verified in both directions: with the bug resto
 it exits 1 with `FAIL iq4_xs half sync: CUDA error: an illegal memory access`; with
 the fix it reports `ALL BIT-EXACT` and exits 0.
 
-## Residual (smaller, still open): server-level spread
+## Residual (resolved - see root cause 2 at the end): server-level spread
 
 After the fix the server still shows a small spread across identical requests
 (550 tok: -2.0252 / -2.0997 / -1.9574 / -2.0028; 30000 tok: the first request changes
@@ -130,3 +130,39 @@ flow: right after a prompt the server sends a second batch that starts at pos n-
 flow directly fails: `llama_memory_seq_rm(mem, 0, 549, -1)` returns 0 because
 `n_rs_seq == 0` (no partial rollback for recurrent memory). Whatever sends that
 batch therefore relies on state bookkeeping that is still unaccounted for.
+
+## Root cause 2 (2026-10-26): D256 prefill kernel used the padded key count as the causal base
+
+`ggml_cuda_flash_attn_ext_sm70_d256` derives causality on its own (it does not read the
+mask tensor): a query at tile row `r` sees KV columns `[0, kv_offset + r]`. The launcher
+computed `kv_offset = kv_len - q_len` with `kv_len = mask->ne[0]`, but `mask->ne[0]` is
+the key count **padded up for tiling** (550 -> 768, 554 -> 768, always <= +255). So for
+a fresh prefill (batch at columns 0..q_len-1, padding after):
+
+- the first rows saw `padding` extra columns - future tokens of the same batch;
+- the last rows saw the padding columns themselves, which hold whatever the previous
+  request left in the KV cache.
+
+The second effect is the residual nondeterminism: after a request the cache keeps its
+last few cells, the next request's prefill reads them through the unclipped bound, and
+the logits move. It also explains why clearing the memory data (`..._clear(mem, true)`)
+hid the problem while `LLAMA_SM70_RS_CLEAR` (recurrent state only) did not - the stale
+bytes are in the attention cache.
+
+Fix: resolve the live key count from the last query row's mask inside the kernel (the
+same monotone probe the decode kernel already uses) and derive
+`kv_offset = live - q_len` from it; the launcher passes the row pointer. Verified:
+
+    probe, server-like flow (warmup + prefill + 4-token chunk, metadata-only clear)
+      before: prefill logit 8.5857 / 9.0110 / 9.1226 / 9.2912, chunk logprob -3.469 / -1.854 / -2.046 / -2.116
+      after:  all four runs bit-identical (prefill 8.0377, chunk -3.5327)
+      stock kernels (LLAMA_SM70_D256=0) give 8.0036 - the remaining 0.034 is the
+      kernel's f16 Q staging, not a mask error (before the fix the gap was 0.58)
+
+    server, four identical requests, 550 tokens: logprob -2.211691141, identical
+    server, three identical requests, 22081 tokens: logprob -2.206210613, identical
+    prefill throughput unchanged (1190 vs 1195 t/s at 22k on the same box)
+
+The first-request-only offset from the IQ4_XS dequant bug above and this padding read
+are independent: the dequant bug made every IQ4_XS weight wrong on the first prefill of
+a process, this one made every prefill depend on the previous request's cache tail.

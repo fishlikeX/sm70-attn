@@ -547,6 +547,7 @@ void sm70_d256_splitd_dense_kernel(
     int heads_q,
     int heads_kv,
     int kv_offset,
+    const half *__restrict__ mask_last_q,
     float softmax_scale_log2,
     const int *__restrict__ block_table,
     int page_size,
@@ -642,6 +643,30 @@ void sm70_d256_splitd_dense_kernel(
         // -INFINITY (every row always sees causal block 0 there).
         row_max[row] = SplitKV3 ? -1.0e30f : -INFINITY;
         row_sum[row] = 0.0f;
+    }
+
+    // The launcher only sees mask->ne[0], which is the PADDED key count, so
+    // kv_offset = kv_len - q_len overstates the causal base by the trailing
+    // padding: the first rows of a fresh prefill would see future tokens and the
+    // last rows would see the padding columns (stale cache contents). Resolve the
+    // live key count from the last query row's mask - the same monotone probe the
+    // decode kernel uses - and derive the base from it. Everything below reads
+    // kv_offset, so overwrite it here.
+    if (mask_last_q != nullptr) {
+        int lo = 0;
+        int hi = kv_len;
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (__half2float(mask_last_q[mid]) > -30000.0f) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        kv_offset = lo - query_len;
+        if (kv_offset < 0) {
+            kv_offset = 0;
+        }
     }
 
     const int max_kv_for_tile = query_row_base + kBlockM + kv_offset;
