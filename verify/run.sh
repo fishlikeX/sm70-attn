@@ -24,7 +24,7 @@ mode="${1:-n}"
 # The harness is valid ONLY against the exact kernel that was static-audited.
 # If the repo drifted, fail loudly instead of producing unverifiable numbers.
 kmd5="$(tr -d '\r' < "$cuda/fattn-sm70-d256-kernel.cuh" | md5sum | cut -d' ' -f1)"   # CRLF-normalized
-expect="250dbaa11b9084776b417d3364649d97"   # fattn-sm70-d256-kernel.cuh @ worktree 2026-10-24b (LF) — drift from 157fa4ab: q4 layout fix ONLY (sm70_q4_dequant_one + _group sequential->canonical {j,j+16}; evidence: docs/q4-layout-audit.md, triple-verified against ggml-quants.c/convert.cu/cpy-utils.cuh); decode tester 13/13 on this state
+expect="0e49bfdd895a27953f4e0ea0bc12bd3f"   # fattn-sm70-d256-kernel.cuh @ PR #3 merge (q8-direct added; q4/f16 paths unchanged) — audit: q8 dequant + Kq8/Vq8 branch only
 if [ "$kmd5" != "$expect" ]; then
     echo "kernel md5 drift: $kmd5 != $expect" >&2
     echo "— audit the diff / update the harness before trusting any numbers" >&2
