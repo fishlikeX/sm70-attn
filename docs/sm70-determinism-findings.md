@@ -166,3 +166,46 @@ same monotone probe the decode kernel already uses) and derive
 The first-request-only offset from the IQ4_XS dequant bug above and this padding read
 are independent: the dequant bug made every IQ4_XS weight wrong on the first prefill of
 a process, this one made every prefill depend on the previous request's cache tail.
+
+## Prefill, not decode, was the tensor-parallel victim (2026-10-26)
+
+Measured on the production config (`-sm tensor -fit off -ub 8192 -c 229376`, MTP
+spec, 2x V100-SXM2 TCC, NVLink P2P up at 145 GB/s/direction):
+
+| prompt | before | after | single V100 (1 card) |
+|---|---|---|---|
+| 554 tok   | ~770 t/s | 947-967 t/s | 611 |
+| 22,081 tok | 739 t/s | **1472 t/s** | 1200 |
+| 174,479 tok | 501.7 t/s | **840 t/s** | 662 |
+
+So tensor parallelism used to be *slower than one card* for prefill and is now
+~1.26x faster than one card (2 cards at 840 vs 1 card at 662; both mean the GPU is
+still the limit, not the link).
+
+### What was wrong
+
+`GGML_CUDA_P2P_AR_MAX_BYTES` defaulted to 1 MiB, and `ggml_cuda_p2p_ar_check` rejects
+anything larger, so every prefill allreduce of a `[n_embd x ub]` f32 partial
+(11 MB at ub 554, 168 MB at ub 8192) fell through to the internal reduce, which stages
+through pinned host memory over PCIe. Skipping the reduce entirely (`LLAMA_SM70_AR_SKIP`,
+numerically wrong, timing only) took the 22k pass from 739 to 1980 t/s: the reduce plus
+its dependency stall was 62% of the TP2 prefill wall, at ~122 ms per 168 MB message
+(1.4 GB/s, PCIe-host territory).
+
+The one-shot P2P reduce stages into *peer device* memory over NVLink instead. Its
+staging buffer has to hold the whole message (the staged kernel writes all of it before
+publishing), which is why the 1 MiB default existed. Raising the default to 176 MiB
+costs `NSLOTS(2) * n_devices * 176 MiB` = ~704 MB of VRAM per device in TP2 only, and
+covers ub 8192 (168 MB) with room for the 2x-headroom ub 4096 case.
+
+Verified after the change: identical requests give identical first-token logprob at
+554, 22,081 and 174,479 tokens (4/3/2 runs), and TP2 VRAM at 229k is 21.8 GB per card.
+
+### Where the remaining prefill gap is
+
+At 22k the pass now runs at ~38% of the per-card fp16 peak (single card: 61%). The
+allreduce still costs ~25% of the wall (1472 vs 1980 with it skipped), because the
+staged kernel moves the message twice (write to peer staging, then read it back for
+the reduction). Next levers, in order: reduce the number of reduce points per pass,
+then halve the AR bytes (the host path already reduces in bf16 above a threshold; the
+P2P path does not), then a direct peer-write-plus-reduce kernel that skips staging.

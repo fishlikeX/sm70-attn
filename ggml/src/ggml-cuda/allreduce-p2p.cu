@@ -473,7 +473,14 @@ ggml_cuda_p2p_ar * ggml_cuda_p2p_ar_init(const int * devices, size_t n_devices) 
         return nullptr;
     }
 
-    size_t max_bytes = 1024*1024;
+    // 2026-10-26: the staged kernel writes the WHOLE message into the staging area,
+    // so max_bytes has to cover it. At 1 MiB the [n_embd x ub] f32 partials of a
+    // prefill (168 MB at ub 8192, 84 MB at 4096) missed this path and fell into the
+    // host-staged copy-engine reduce: measured 739 -> 1726 t/s at 22k on 2x V100
+    // when they take this one instead (NVLink peer writes, no PCIe round trip).
+    // Cost: NSLOTS(2) * n_devices * max_bytes of VRAM per device (~704 MB on 2 GPUs),
+    // only when tensor parallelism is actually in use. Override with the env knob.
+    size_t max_bytes = 176ull*1024*1024;
     if (const char * env = getenv("GGML_CUDA_P2P_AR_MAX_BYTES")) {
         max_bytes = (size_t) atoll(env);
     }
