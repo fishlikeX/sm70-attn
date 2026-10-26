@@ -39,6 +39,11 @@ kernel into llama.cpp master and builds the production stack on top of it:
   halved;
 - **q4_0 in-kernel direct loads** (opt-in): XQA-style per-dtype template loads
   that read the raw block cache into the MMA fragments, no f16 mirror.
+- **q8_0 in-kernel direct loads** (opt-in, PR #3): the same template
+  architecture for q8_0 K/V, bit-identical to the staged f16 mirror (verified
+  here at 22k and 174k: top-3 logprobs to 9 decimals). Opt-in because the
+  mirror is cheap on this box (0.94 GB/card at 229k) and direct is ~9% slower
+  at 174k; it exists for weight sets where the mirror does not fit.
 
 **Decode**
 - **D256 tensor-core decode kernel** for speculative-verify widths (w≥2), with
@@ -240,6 +245,7 @@ llama.cpp native path automatically — no config needed.
 | `LLAMA_SM70_SPLITKV3_MIN_KV` | `2048` | SplitKV3 activation threshold (kv_len); `0` disables |
 | `LLAMA_SM70_D256_Q4_DIRECT` | `0` | In-kernel q4_0 direct loads (no f16 K/V mirror): saves VRAM, ~4% slower prefill |
 | `LLAMA_SM70_D256_DECODE` | `0` | D256 tensor-core decode kernel (spec-verify widths w≥2) |
+| `LLAMA_SM70_D256_Q8_DIRECT` | `0` | q8_0 K/V read as raw blocks in-kernel. Bit-identical to the staged mirror (22k and 174k, top-3 logprobs), but ~9% slower at 174k (792 vs 871 t/s): here the f16 mirror costs only 0.94 GB/card, so the opt-in is for VRAM-constrained setups. The TC decode kernel takes f16/q4_0, so a q8_0 cache decodes on the stock path |
 | `LLAMA_SM70_D256_DEC_Q4` | `0` | q4_0 direct loads in the decode kernel |
 | `LLAMA_SM70_D256_SPLITS` | `0` | Decode KV-split cap override (`0` = auto `kv_len/920`, cap 48; max 256) |
 | `LLAMA_SM70_DEQUANT_FAST` | `1` | sm_70 iq3_s/iq3_xxs/iq4_xs dequant kernels; `0` = stock dequant |
