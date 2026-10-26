@@ -144,7 +144,9 @@ __global__ void dequant_iq4_xs_sm70(const void * __restrict__ vx, dst_t * __rest
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         v[j]   = d * (float) kvalues_iq4nl[(q >> (8 * j)) & 0xF];
-        v[j+4] = d * (float) kvalues_iq4nl[(q >> (8 * j)) >> 4];
+        // the high nibble must be masked: q is a 32-bit word, so an unmasked
+        // (q >> 8j) >> 4 indexes the 16-entry LUT far out of bounds
+        v[j+4] = d * (float) kvalues_iq4nl[((q >> (8 * j)) >> 4) & 0xF];
     }
     if constexpr (std::is_same_v<dst_t, half>) {
         half lo[4], hi[4];
