@@ -1,0 +1,67 @@
+<!doctype html><html><head><meta charset="utf-8"><title>sm70-attn prefill throughput</title><style>html,body{margin:0;padding:0;background:#0b0f14}</style></head><body><svg xmlns="http://www.w3.org/2000/svg" width="1400" height="940" viewBox="0 0 1400 940" font-family="Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif">
+<defs>
+<linearGradient id="fade" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#2ecc71" stop-opacity="0.26"/><stop offset="100%" stop-color="#2ecc71" stop-opacity="0.0"/></linearGradient>
+</defs>
+<rect width="1400" height="940" fill="#0b0f14"/>
+<text x="44" y="62" font-size="34" font-weight="700" fill="#e6edf3">Prefill</text>
+<text x="168" y="62" font-size="34" font-weight="700" fill="#2ecc71">Throughput</text>
+<text x="44" y="94" font-size="15" fill="#8b949e">单张 V100-SXM2 · Qwen3.8-27B GSQ-RCO-IQ3_S-mtp · -fa on, q4_0 KV · tok/s vs prompt length</text>
+<line x1="1160" y1="50" x2="1196" y2="50" stroke="#2ecc71" stroke-width="3"/>
+<text x="1204" y="55" font-size="15" fill="#e6edf3">sm70-attn</text>
+<line x1="1160" y1="82" x2="1196" y2="82" stroke="#8b949e" stroke-width="2" stroke-dasharray="5 4"/>
+<text x="1204" y="87" font-size="15" fill="#8b949e">stock</text>
+<rect x="24" y="118" width="1352" height="500" rx="14" fill="#0f141b" stroke="#1f262e"/>
+<line x1="124" y1="556.0" x2="1236" y2="556.0" stroke="#1b222b"/>
+<text x="110" y="560.0" font-size="13" fill="#8b949e" text-anchor="end">0</text>
+<line x1="124" y1="429.3" x2="1236" y2="429.3" stroke="#1b222b"/>
+<text x="110" y="433.3" font-size="13" fill="#8b949e" text-anchor="end">400</text>
+<line x1="124" y1="302.7" x2="1236" y2="302.7" stroke="#1b222b"/>
+<text x="110" y="306.7" font-size="13" fill="#8b949e" text-anchor="end">800</text>
+<line x1="124" y1="176.0" x2="1236" y2="176.0" stroke="#1b222b"/>
+<text x="110" y="180.0" font-size="13" fill="#8b949e" text-anchor="end">1200</text>
+<line x1="137.7" y1="176" x2="137.7" y2="556" stroke="#1b222b"/>
+<text x="137.7" y="582" font-size="13" fill="#8b949e" text-anchor="middle">20k</text>
+<line x1="412.3" y1="176" x2="412.3" y2="556" stroke="#1b222b"/>
+<text x="412.3" y="582" font-size="13" fill="#8b949e" text-anchor="middle">60k</text>
+<line x1="686.9" y1="176" x2="686.9" y2="556" stroke="#1b222b"/>
+<text x="686.9" y="582" font-size="13" fill="#8b949e" text-anchor="middle">100k</text>
+<line x1="961.4" y1="176" x2="961.4" y2="556" stroke="#1b222b"/>
+<text x="961.4" y="582" font-size="13" fill="#8b949e" text-anchor="middle">140k</text>
+<line x1="1236.0" y1="176" x2="1236.0" y2="556" stroke="#1b222b"/>
+<text x="1236.0" y="582" font-size="13" fill="#8b949e" text-anchor="middle">180k</text>
+<polygon points="152.0,556.0 152.0,232.3 318.3,264.3 687.7,323.0 1198.1,371.3 1198.1,556.0" fill="url(#fade)"/>
+<polyline points="152.0,232.3 318.3,264.3 687.7,323.0 1198.1,371.3" fill="none" stroke="#2ecc71" stroke-width="3.5" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="152.0" cy="232.3" r="4.5" fill="#2ecc71"/>
+<circle cx="318.3" cy="264.3" r="4.5" fill="#2ecc71"/>
+<circle cx="687.7" cy="323.0" r="4.5" fill="#2ecc71"/>
+<circle cx="1198.1" cy="371.3" r="4.5" fill="#2ecc71"/>
+<polyline points="152.0,263.6 318.3,313.5 687.7,382.1 1198.1,431.3" fill="none" stroke="#8b949e" stroke-width="2" stroke-dasharray="6 5" stroke-linejoin="round"/>
+<circle cx="152.0" cy="263.6" r="3.6" fill="#8b949e"/>
+<circle cx="318.3" cy="313.5" r="3.6" fill="#8b949e"/>
+<circle cx="687.7" cy="382.1" r="3.6" fill="#8b949e"/>
+<circle cx="1198.1" cy="431.3" r="3.6" fill="#8b949e"/>
+<text x="152.0" y="220.3" font-size="13" fill="#3fb950" text-anchor="middle">1022</text>
+<text x="318.3" y="252.3" font-size="13" fill="#3fb950" text-anchor="middle">921</text>
+<text x="687.7" y="311.0" font-size="13" fill="#3fb950" text-anchor="middle">736</text>
+<line x1="1222.1" y1="371.3" x2="1222.1" y2="431.3" stroke="#2ecc71" stroke-width="2"/>
+<path d="M 1222.1 369.3 l -5 -8 l 10 0 z" fill="#2ecc71"/>
+<path d="M 1222.1 433.3 l -5 8 l 10 0 z" fill="#2ecc71"/>
+<text x="1186.1" y="357.3" font-size="15" font-weight="700" fill="#2ecc71" text-anchor="end">583 tok/s</text>
+<text x="1188.1" y="453.3" font-size="13" fill="#8b949e" text-anchor="end">stock 394</text>
+<text x="1234.1" y="408.3" font-size="22" font-weight="700" fill="#2ecc71">+48.1%</text>
+<text x="1234.1" y="429.3" font-size="12" fill="#8b949e">prefill @174k</text>
+<text x="164.0" y="254.3" font-size="12" fill="#3fb950">peak</text>
+<rect x="44" y="650" width="320" height="150" rx="14" fill="#0f141b" stroke="#1f262e"/>
+<text x="70" y="716" font-size="40" font-weight="700" fill="#2ecc71">1022 tok/s</text>
+<text x="70" y="750" font-size="14" fill="#8b949e">prefill @22k（峰值）</text>
+<rect x="388" y="650" width="320" height="150" rx="14" fill="#0f141b" stroke="#1f262e"/>
+<text x="414" y="716" font-size="40" font-weight="700" fill="#2ecc71">+48.1%</text>
+<text x="414" y="750" font-size="14" fill="#8b949e">prefill vs stock @174k</text>
+<rect x="732" y="650" width="320" height="150" rx="14" fill="#0f141b" stroke="#1f262e"/>
+<text x="758" y="716" font-size="40" font-weight="700" fill="#e6edf3">583 tok/s</text>
+<text x="758" y="750" font-size="14" fill="#8b949e">prefill @174k</text>
+<rect x="1076" y="650" width="320" height="150" rx="14" fill="#0f141b" stroke="#1f262e"/>
+<text x="1102" y="716" font-size="40" font-weight="700" fill="#2ecc71">26.0 tok/s</text>
+<text x="1102" y="750" font-size="14" fill="#8b949e">decode @174k（stock 19.6，+32%）</text>
+<text x="44" y="888" font-size="13" fill="#8b949e">实测 2026-10-26 · 单卡默认 knobs（SKINNY=2 在 -c 229k 单卡 OOM）· n_predict=96 · decode 受 MTP 接受率影响（±15%），仅同 prompt 对比有效 · 数据 bench/perf-2026-10-26-1gpu.csv</text>
+</svg></body></html>
