@@ -525,6 +525,9 @@ docs/sm70-*.md                    # decode port plan, determinism findings, GDN 
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) — host (MIT)
 - WyvernTKC/llama.cpp-4xV100 — the one-shot P2P allreduce design this port is
   adapted from (MIT)
+- llama.cpp-v100 v100-1.1.1 — the skinny small-M GEMM family and the GDN
+  chunked-prefill kernels this fork ports (MIT, see
+  `ggml/src/ggml-cuda/LICENSE.v100-skinny`)
 
 Human–AI collaboration: AI-assisted commits carry a
 `Co-authored-by: Hermes-Tianji <hermes-tianji@users.noreply.github.com>`
@@ -532,5 +535,13 @@ trailer. The 08-18..08-24 commits (including the 9-line stride fix) and five
 2026-08-26 commits predate that convention and were pushed without it; this line
 covers them.
 
-License follows upstream: MIT (llama.cpp parts) + BSD-3 (flash vendor) +
-Apache-2.0 (cutlass vendor).
+License: **MIT**, the same as upstream llama.cpp (see [LICENSE](LICENSE)). The
+third-party headers vendored under `ggml/src/ggml-cuda/` keep their own
+licenses, all permissive and compatible with MIT:
+
+| Path | License |
+|---|---|
+| root `LICENSE` | MIT (ggml authors) |
+| `sm70-vendor/cute`, `sm70-vendor/cutlass` | Apache-2.0 (`sm70-vendor/LICENSE-cute-cutlass`) |
+| `sm70-vendor/flash` | BSD-3 (`sm70-vendor/LICENSE-flash-attention`) |
+| `LICENSE.v100-skinny` (skinny small-M GEMMs, GDN chunk kernels) | MIT |

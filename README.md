@@ -478,11 +478,20 @@ docs/sm70-*.md                    # 解码移植计划、确定性归因、GDN �
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) —— 宿主（MIT）
 - WyvernTKC/llama.cpp-4xV100 —— 单发 P2P allreduce 设计来源（MIT），本移植
   做了本地化改造
+- llama.cpp-v100 v100-1.1.1 —— 瘦身小 M GEMM 家族与 GDN 分块预填充 kernel 的
+  来源（MIT，见 `ggml/src/ggml-cuda/LICENSE.v100-skinny`）
 
 人机协作：AI 参与的提交带
 `Co-authored-by: Hermes-Tianji <hermes-tianji@users.noreply.github.com>`
 尾注。08-18..08-24 的提交（包括 9 行 stride 修复）与五个 2026-08-26 的提交早于
 该约定，未带尾注；本行一并覆盖。
 
-许可证随上游：MIT（llama.cpp 部分）+ BSD-3（flash vendor）+
-Apache-2.0（cutlass vendor）。
+许可证：**MIT**，与上游 llama.cpp 一致（见根目录 `LICENSE`）。vendored 在
+`ggml/src/ggml-cuda/` 下的第三方头文件保留各自许可，都是宽松许可、与 MIT 兼容：
+
+| 路径 | 许可 |
+|---|---|
+| 根 `LICENSE` | MIT（ggml authors） |
+| `sm70-vendor/cute`、`sm70-vendor/cutlass` | Apache-2.0（`sm70-vendor/LICENSE-cute-cutlass`） |
+| `sm70-vendor/flash` | BSD-3（`sm70-vendor/LICENSE-flash-attention`） |
+| `LICENSE.v100-skinny`（瘦身小 M GEMM、GDN 分块 kernel） | MIT |
