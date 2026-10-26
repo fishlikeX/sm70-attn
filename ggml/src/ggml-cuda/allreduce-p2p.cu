@@ -90,9 +90,11 @@ static __global__ void ggml_cuda_p2p_ar_kernel(const ggml_cuda_p2p_ar_args a) {
     }
 
     // 2. publish. __syncthreads first, so the fence covers every thread's stores and not just
-    //    those of thread 0.
+    //    those of thread 0. Device scope is enough: the slice and the flag both target the
+    //    peer's device memory, so ordering them against each other does not need a
+    //    system-wide (PCIe-visible) flush, which cost milliseconds per 168 MB slice.
     __syncthreads();
-    __threadfence_system();
+    __threadfence();
 
     if (threadIdx.x == 0) {
         for (int j = 0; j < a.n_devs; ++j) {
