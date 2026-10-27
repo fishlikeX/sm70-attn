@@ -14,10 +14,30 @@ const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memo
 // a card's energy used: Wh, in kWh once it is worth it (a V100 at 45 W reaches 1 kWh in a day)
 const wh = (v) => (v == null ? "–" : v >= 1000 ? `${fmt(v / 1000, 2)} kWh` : `${fmt(v, v < 10 ? 1 : 0)} Wh`);
 
+// The launcher is the single source of truth for the chat, the sampler, the key,
+// the theme and the language (sm70gui-ui.json beside its settings), so this window,
+// Edge and any other client on the PC share one copy. localStorage is only the
+// local cache that makes the first paint instant; syncUiState() at the bottom of
+// this file adopts the launcher's copy and set() mirrors changes back to it.
 const store = {
+  ready: false,            // false until the launcher's copy has been read/written
+  timers: {},
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
+  cache(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); } catch (e) { /* in memory only */ } },
+  set(k, v) { this.cache(k, v); this.push(k, v); },
+  push(k, v) {
+    if (!this.ready) return;             // before the first sync: never clobber the file
+    clearTimeout(this.timers[k]);
+    this.timers[k] = setTimeout(async () => {
+      try {
+        const r = await fetch("ui-state", {method: "POST", headers: {"Content-Type": "application/json"},
+                                           body: JSON.stringify({[k]: v})});
+        if (r.ok) { const j = await r.json(); if (j.at) uiStateAt = j.at; }
+      } catch (e) { /* launcher gone: stay local */ }
+    }, 600);
+  },
 };
+let uiStateAt = 0;
 
 // ------------------------------------------------------------------ toasts
 function toast(kind, title, text = "", ms = 3500, action = null) {
@@ -75,14 +95,18 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
+  if (tab === "launch" && name !== "launch" && window.SM70Launch && window.SM70Launch.flush) {
+    window.SM70Launch.flush();     // a 500 ms debounce must not lag behind the other views
+  }
+  tab = ["chat", "images", "monitor", "launch", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "launch", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") $("img-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
-  if (tab === "about") loadConfig();
+  if (tab === "launch" && window.SM70Launch) window.SM70Launch.show();
+  if (tab === "about") { loadConfig(); loadSelection(); loadServerInfo(); }
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -97,21 +121,42 @@ function headers(json = false) {
   return h;
 }
 $("api-key").value = store.get("apikey", "");
-$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Shared by every client on this PC."); };
 
-let health = {model: "strata", images: false, max_context: 0};
+let health = {model: "sm70-attn", images: false, max_context: 0};
 async function loadHealth() {
   try {
-    health = await (await fetch("health")).json();
+    const h = await (await fetch("health")).json();
+    if (h.status !== "ok") throw new Error("not ok");
+    try {
+      const props = await (await fetch("props")).json();
+      health.model = props.model_path ? baseName(props.model_path) : health.model;
+      health.max_context = props.default_generation_settings?.n_ctx || 0;
+      // /props.modalities is the only truthful answer to "can this server take a
+      // picture": it is on exactly when an mmproj loaded. Before this the flag
+      // stayed false forever, so the composer refused images (and Ctrl+V did
+      // nothing) even with a vision head running.
+      health.images = !!(props.modalities && props.modalities.vision);
+    } catch (e) { /* props may be off; keep defaults */ }
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    $("chat-empty-sub").textContent = health.model && health.model !== "sm70-attn"
+      ? `${health.model} · local, nothing leaves this PC`
+      : "Local inference · nothing leaves this PC";
     $("tab-btn-images").hidden = !health.image_generation;
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
 }
+// A restart through the launcher can add (or drop) the vision head while this page
+// stays open, and the form can move --port; re-read the facts while visible instead
+// of requiring a reload.
+setInterval(() => {
+  if (document.hidden || busy) return;
+  loadHealth();
+  if (tab === "about") { loadServerInfo(); loadSelection(); }
+}, 5000);
 
 // ------------------------------------------------------------------ Monitor
 // The Monitor tab, rendered from GET /metrics: the engine's own numbers, the hardware sampler's one-second series
@@ -225,7 +270,7 @@ const KPIS = [
   {key: "duration", label: "Request time", icon: "activity"},
   {key: "requests", label: "Requests", icon: "layers"},
   {key: "tokens", label: "Tokens written", icon: "memory"},
-  {key: "hit", label: "Expert cache hit", icon: "experts"},
+  {key: "hit", label: "Prompt cache hit", icon: "experts"},
   {key: "spec", label: "Draft acceptance", icon: "bolt"},
 ];
 $("kpis").innerHTML = KPIS.map((k) => `
@@ -248,6 +293,7 @@ const kpiValue = (text, unit) => (text === "–" ? "–" : `${esc(text)}${unit ?
 function gpuCards(hw, h, st) {
   const cards = hw.gpus || [];
   const names = String(st.gpu_name || "").split(" + ");
+  const cardName = (i) => names[i] || (names.length === 1 ? names[0] : "");
   const block = (label, value, note, path, bar, tone) => `<div class="gpu-block">
     <div class="gpu-block__top"><span>${esc(label)}</span><span><b>${value}</b>${note ? ` <em>${esc(note)}</em>` : ""}</span></div>
     ${bar == null ? "" : `<div class="st-progress"${tone ? ` data-tone="${tone}"` : ""}><div class="st-progress__bar" style="width:${Math.max(0, Math.min(100, bar)).toFixed(1)}%"></div></div>`}
@@ -257,14 +303,10 @@ function gpuCards(hw, h, st) {
     const i = g.index;
     const memPct = g.mem_used != null && g.mem_total ? (100 * g.mem_used) / g.mem_total : null;
     const pwPct = g.power != null && g.power_limit ? (100 * g.power) / g.power_limit : null;
-    // the card's own counter: it runs from driver load, so it survives a reload and is not the page's total
-    const since = g.energy_wh != null ? "since driver load" : "";
-    const gen = g.pcie_gen_max || g.pcie_gen;
-    const link = gen ? `Gen${gen}${g.pcie_width ? ` x${g.pcie_width}` : ""}${g.pcie_gen && g.pcie_gen < gen ? ` · idle Gen${g.pcie_gen}` : ""}` : "–";
-    const mb = (v) => (v == null ? "–" : `${fmt(v, v < 10 ? 1 : 0)} MB/s`);
+
     return `<div class="st-card gpu-card">
       <div class="gpu-card__head"><span class="gpu-card__index">GPU ${esc(i)}</span>
-        <span class="gpu-card__name" title="${esc(names[i] || st.gpu_name || "")}">${esc(names[i] || st.gpu_name || "")}</span></div>
+        <span class="gpu-card__name" title="${esc(cardName(i))}">${esc(cardName(i))}</span></div>
       ${block("Load", pctText(g.util), "", sparkPaths(h[`gpu${i}_util`], 100), g.util, "warn")}
       ${block("VRAM", g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`, g.mem_total ? `of ${gb(g.mem_total, 0)} GB` : "",
               sparkPaths(h[`gpu${i}_mem_used`], g.mem_total), memPct, null)}
@@ -272,9 +314,6 @@ function gpuCards(hw, h, st) {
               sparkPaths(h[`gpu${i}_temp`], 90), g.temp == null ? null : Math.min(100, g.temp), "warn")}
       ${block("Power", g.power == null ? "–" : `${fmt(g.power)} W`, g.power_limit ? `of ${fmt(g.power_limit)} W` : "",
               sparkPaths(h[`gpu${i}_power`], g.power_limit), pwPct, null)}
-      ${block("Energy", wh(g.energy_wh), since, null, null, null)}
-      <div class="gpu-pcie"><span>PCIe <b>${esc(link)}</b></span>
-        <span>rx <b>${mb(g.pcie_rx_mb)}</b> · tx <b>${mb(g.pcie_tx_mb)}</b></span></div>
     </div>`;
   }).join("");
 }
@@ -301,7 +340,7 @@ function sysMetrics(hw, st, h) {
   const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : null;
   return [
     metricTile("CPU load", "cpu", hw.cpu == null ? "–" : `${fmt(hw.cpu)}<small>%</small>`,
-               `${st.cores ? `${fmt(st.cores)} cores · ` : ""}${st.threads ? `${fmt(st.threads)} threads` : ""}`,
+               st.threads ? `${fmt(st.threads)} threads` : "",
                hw.cpu, hw.cpu != null && hw.cpu > 90 ? "danger" : null, sparkPaths(h.cpu, 100)),
     metricTile("System RAM", "memory", hw.ram_used == null ? "–" : `${gb(hw.ram_used)}<small>GB</small>`,
                hw.ram_total ? `of ${gb(hw.ram_total, 0)} GB` : "", ramPct,
@@ -351,6 +390,7 @@ async function poll() {
     if (++metricsFailures === 3) setPill("error", "Server not reachable");
   }
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
+  if (tab === "about") loadSelection();   // /selection is a prefs read (~1 ms); keeps About live
   setTimeout(poll, 1000);
 }
 
@@ -468,7 +508,7 @@ function renderMonitor(m) {
   $("state-live").innerHTML = chips.map(([k, v]) => `<span class="live-chip">${esc(k)} <b>${esc(v)}</b></span>`).join("");
 
   // the tiles: the session's averages, the recent window beside them
-  const readTokens = Math.max(0, (totals.prompt_tokens || 0) - (totals.reused || 0));
+  const readTokens = totals.prompt_tokens || 0;   // the counter already excludes cached tokens
   const sessionDecode = totals.decode_ms > 0 && totals.output_tokens ? totals.output_tokens / (totals.decode_ms / 1000) : null;
   const sessionPrefill = totals.prompt_ms > 0 && readTokens ? readTokens / (totals.prompt_ms / 1000) : null;
   const sessionTtft = totals.ttft_ms > 0 && totals.requests ? totals.ttft_ms / totals.requests : null;
@@ -480,19 +520,26 @@ function renderMonitor(m) {
   const winSpec = mean(win.map((r) => (r.drafts_offered ? (100 * (r.drafts_accepted || 0)) / r.drafts_offered : null)));
   const errors = requests.filter((r) => r.finish === "error").length;
   setKpi("decode", kpiValue(fmt(sessionDecode ?? winDecode, 1), "t/s"),
-         `now ${rate(live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null)} · recent ${rate(winDecode)}`);
+         `recent ${rate(winDecode)}`);
   setKpi("prefill", kpiValue(fmt(sessionPrefill ?? winPrefill, 1), "t/s"),
-         `now ${rate(live.state === "idle" ? null : live.prefill_tok_s_mean)} · recent ${rate(winPrefill)}`);
-  setKpi("ttft", kpiValue(dur(sessionTtft), ""),
+         `now ${rate(lastOf(h.prefill_tok_s_mean))} · recent ${rate(winPrefill)}`);
+  setKpi("ttft", kpiValue(dur(winTtft), ""),
          `recent ${dur(winTtft)} · last ${dur(last ? last.ttft_ms : null)}`);
   setKpi("duration", kpiValue(winDuration == null ? "–" : fmt(winDuration, 1), "s"), `${fmt(win.length)} recent requests`);
-  setKpi("requests", kpiValue(fmt(totals.requests || 0), ""),
-         `${fmt(keptCount)} kept · ${fmt(errors)} error${errors === 1 ? "" : "s"}`);
+  setKpi("requests", kpiValue(fmt(requests.length), ""),
+         `${fmt(totals.decode_steps ?? 0)} decode steps · ${fmt(errors)} error${errors === 1 ? "" : "s"}`);
   setKpi("tokens", kpiValue(kfmt(totals.output_tokens || 0), ""),
          `${kfmt(readTokens)} prompt read · ${kfmt(totals.reused || 0)} reused`);
-  setKpi("hit", kpiValue(pctText(winHit, 1), ""), `last ${pctText(last && last.hit_rate != null ? last.hit_rate * 100 : null, 1)}`);
-  setKpi("spec", kpiValue(pctText(winSpec, 1), ""),
-         `${fmt(totals.drafts_accepted || 0)} of ${fmt(totals.drafts_offered || 0)} drafts accepted`);
+  {
+    const pt = totals.prompt_tokens || 0, rt = totals.reused || 0;
+    const sessionHit = pt + rt ? (100 * rt) / (pt + rt) : null;
+    setKpi("hit", kpiValue(pctText(sessionHit, 1), ""),
+           `${fmt(rt)} reused of ${fmt(pt + rt)} prompt tokens seen`);
+  }
+  const sessionSpec = totals.drafts_offered
+    ? (100 * (totals.drafts_accepted || 0)) / totals.drafts_offered : null;
+  setKpi("spec", kpiValue(pctText(sessionSpec ?? winSpec, 1), ""),
+         `${fmt(totals.drafts_accepted || 0)} of ${fmt(totals.drafts_offered || 0)} drafts accepted (session)`);
   spark("kpispark-decode", h.tok_s);
   spark("kpispark-prefill", h.prefill_tok_s_mean);
   spark("kpispark-ttft", win.map((r) => r.ttft_ms).reverse());
@@ -535,11 +582,11 @@ function renderMonitor(m) {
   setText("ctx-pct", `${Math.round(frac * 100)}%`);
   setText("ctx-sub", ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–");
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
-  setText("slots-text", eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–");
-  $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
-  const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
-  setText("kv-text", kv ? `${kv}${eng.kv_resident ? `, ${fmt(eng.kv_resident)} positions streamed` : ", all in VRAM"}` : "–");
-  setText("spec-text", eng.spec ? `MTP, up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} drafts${eng.lookup ? " + lookup" : ""}` : "off");
+  setText("slots-text", `${fmt(requests.length)} requests · cache ${kfmt(totals.reused || 0)} tok reused`);
+  $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * (hw.gpus?.[1]?.mem_used || 0)) / hw.gpu_mem_total)}%` : "0%";
+  const kv = {q4_0: "q4_0 · SM70 direct", q8_0: "q8_0", f16: "f16"}[eng.kv] || eng.kv || "q4_0";
+  setText("kv-text", kv);
+  setText("spec-text", "MTP, n_max 3");
   setText("kept-text", `${fmt(requests.length)} of ${fmt(keptCount)}`);
 
   // this machine
@@ -571,7 +618,7 @@ function renderMonitor(m) {
         <td class="num">${fmt(reqPrefill(r), 0)}</td>
         <td class="num">${fmt(r.output_tokens)}</td>
         <td class="num">${fmt(r.decode_tok_s, 1)}</td>
-        <td class="num" title="Expert cache hit rate${drafts ? `; ${drafts}` : ""}">${hit}</td>
+        <td class="num" title="Prompt tokens reused from cache">${r.reused != null ? fmt(r.reused) : "–"}</td>
         <td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }
@@ -614,24 +661,116 @@ function projectionText(c) {
          `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
          "describes the vector as a refusal-direction projection; measure the speed yourself";
 }
+// The launcher owns what will be started (model path or -hf repo, alias). /selection is
+// cheap (no folder scan), so About can re-read it while visible instead of showing a
+// snapshot from the moment the tab was opened.
+let sel = null;
+let selTick = 0;
+async function loadSelection() {
+  try { sel = await (await fetch("selection")).json(); } catch (e) { sel = null; }
+  if (sel) {
+    setSwitch("autostart-toggle", sel.autostart);
+    setSwitch("minimize-toggle", sel.minimize_tray);
+  }
+  if (lastMetrics) render(lastMetrics);
+}
+
+// The launcher's view of the server it runs: the live port and the argv it was
+// started with. About's "Connect your tools" used location.origin, i.e. the GUI
+// port, which stops being the API port as soon as --port is changed in the form.
+let srvInfo = null;
+async function loadServerInfo() {
+  try { srvInfo = await (await fetch("server")).json(); } catch (e) { srvInfo = null; }
+  if (lastMetrics) render(lastMetrics);
+}
+
+// Launcher-owned switches (stored in the launcher config, not this browser):
+// - autostart: load the saved model when the exe starts (off by default)
+// - minimize_tray: the X button hides to the tray instead of quitting (on by default)
+function setSwitch(id, on) {
+  const t = $(id);
+  if (t) t.setAttribute("aria-checked", String(!!on));
+}
+async function flipSwitch(id, key) {
+  const before = $(id).getAttribute("aria-checked") === "true";
+  const next = !before;
+  setSwitch(id, next);                      // optimistic: the switch must feel immediate
+  try {
+    const r = await fetch("save", {method: "POST", headers: {"Content-Type": "application/json"},
+                                   body: JSON.stringify({[key]: next})});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.message || `HTTP ${r.status}`);
+  } catch (e) {
+    setSwitch(id, before);
+    const t = (k, d) => (window.SM70I18n ? SM70I18n.t(k) : d);
+    toast("error", t("about.autostartFailed", "Could not save the setting"),
+          String(e.message || e), 3000);
+  }
+}
+$("autostart-toggle").onclick = () => flipSwitch("autostart-toggle", "autostart");
+$("minimize-toggle").onclick = () => flipSwitch("minimize-toggle", "minimize_tray");
+const SEP = String.fromCharCode(92) + "/";  // both separators, no escape games
+const baseName = (p) => {
+  const s = String(p || "");
+  let i = -1;
+  for (const c of SEP) i = Math.max(i, s.lastIndexOf(c));
+  return i >= 0 ? s.slice(i + 1) : s;
+};
+
+// What the running server was actually told. About used to print fixed values -
+// q4_0 KV and "MTP drafts up to 2" - even with speculation off, a draft model or
+// another KV type. The launcher reports the argv it spawned (GET /server); an
+// external server has none, and then we say nothing instead of guessing.
+function liveEngineFacts() {
+  const cmd = srvInfo && Array.isArray(srvInfo.cmdline) ? srvInfo.cmdline : null;
+  if (!cmd || !cmd.length) return { kv: null, spec: null };
+  const arg = (flag) => {
+    const i = cmd.indexOf(flag);
+    return i >= 0 && i + 1 < cmd.length ? cmd[i + 1] : "";
+  };
+  const name = (t) => ({q4_0: "4-bit (Hadamard-rotated)", q8_0: "8-bit", f16: "16-bit"}[t] || t);
+  const k = arg("-ctk"), v = arg("-ctv");
+  const kv = !k ? null : (!v || v === k ? name(k) : `K ${name(k)} / V ${name(v)}`);
+  const type = arg("--spec-type") || (arg("--spec-draft-model") ? "draft-simple" : "");
+  const n = Number(arg("--spec-draft-n-max") || 0);
+  let spec = null;
+  if (type && type !== "none") {
+    if (type === "draft-mtp") spec = `MTP drafts up to ${Math.max(0, n - 1)} tokens`;
+    else {
+      const d = arg("--spec-draft-model");
+      spec = `${type}${d ? ` · ${baseName(d)}` : ""}${n ? ` (n=${n})` : ""}`;
+    }
+  }
+  return { kv, spec };
+}
+
 function renderAbout(eng, hw, st) {
-  const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+  const live = liveEngineFacts();
   facts($("facts-engine"), [
     ["Model", eng.model],
-    ["Engine", eng.version ? `v${eng.version}` : "built from source"],
+    ["Engine", eng.version || null],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
-    ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
+    ["KV cache", live.kv ? `${live.kv}, all in VRAM` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
-    ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
+    ["Speculation", live.spec],
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
+    [window.SM70I18n ? SM70I18n.t("about.configured") : "Configured model (launcher)",
+     sel && sel.model ? (/\.gguf$/i.test(sel.model) ? baseName(sel.model) : sel.model) : null],
+    [window.SM70I18n ? SM70I18n.t("about.alias") : "Model name (alias)",
+     sel && sel.args ? sel.args.alias : null],
+    [window.SM70I18n ? SM70I18n.t("about.draft") : "Speculative draft model",
+     sel && sel.args ? (sel.args.draft_model ? baseName(sel.args.draft_model) : null) : null],
   ]);
   facts($("facts-hw"), [
     ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);
-  const base = location.origin;
+  // the API lives on the llama-server port, which is not the page's port once the
+  // form sets --port; /server reports the one that is actually in use
+  const apiPort = (srvInfo && srvInfo.port) || location.port;
+  const base = `${location.protocol}//${location.hostname}:${apiPort}`;
   facts($("facts-api"), [
     ["OpenAI base URL", `${base}/v1`, true],
     ["Anthropic base URL", base, true],
@@ -648,18 +787,7 @@ $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (las
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
 // "strata_mcp": true, which only this page sends); the Monitor lists the servers and what they offer.
 let mcpInfo = {servers: [], tools: 0}, mcpRetry = null;
-async function loadMcp() {
-  try {
-    const r = await fetch("mcp", {headers: headers()});
-    if (!r.ok) return;
-    mcpInfo = await r.json();
-  } catch (e) { return; /* an older server: no MCP */ }
-  renderMcp();
-  clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
-  if ((mcpInfo.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
-}
-const MCP_STATE = {ready: ["st-badge--generating", "Connected"], starting: ["st-badge--reading", "Starting"],
-                   failed: ["st-badge--error", "Failed"], stopped: ["st-badge--queued", "Stopped"], idle: ["", "Waiting"]};
+async function loadMcp() { /* sm70: no MCP endpoint; panel stays hidden */ }
 function renderMcp() {
   const servers = mcpInfo.servers || [];
   $("mcp-card").hidden = !servers.length;
@@ -685,7 +813,7 @@ function renderMcp() {
 let cfgKeys = [];
 async function loadConfig() {
   let r;
-  try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
+  return; // sm70: no run-config endpoint; the launcher owns startup parameters
   if (!r.ok) { $("cfg-card").hidden = true; return; }       // no run config, an older server, or no key yet
   const c = await r.json();
   cfgKeys = c.keys || [];
@@ -723,7 +851,7 @@ $("cfg-save").addEventListener("click", async () => {
   });
   if (!Object.keys(set).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
   try {
-    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set})});
+    return; // sm70: read-only settings here; startup params live in the launcher
     const b = await r.json();
     if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
     $("cfg-msg").textContent = b.changed.length
@@ -806,21 +934,38 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
+const DEFAULTS = {thinking: "medium", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
 }
+// one-time hygiene: purge assistant turns with no answer text from the STORED
+// chat (the -n 320 era left corpses that derailed later prompts even after the
+// apiMessages fix, because they kept coming back from localStorage)
+{
+  const stored = store.get("chat", []);
+  if (Array.isArray(stored)) {
+    const cleaned = stored.filter((m) => !(m.role === "assistant" && !m.text && !m.error));
+    if (cleaned.length !== stored.length) store.set("chat", cleaned);
+  } else {
+    store.set("chat", []);   // a hand-edited/older value must not break the module
+  }
+}
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+// llama-server's qwen chat template accepts xhigh | high? no: xhigh/medium/low.
+// "high" came from Strata's defaults and 400s the template — remap it.
+if (settings.thinking === "high") settings.thinking = "xhigh";
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
 
 function saveChat() {
+  // keep the last file's text so a reload does not silently drop attachments
+  // (bounded at 512 KB per file, matching MAX_TEXT_FILE)
   store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                           files: (m.files || []).map((f) => ({name: f.name}))})));
+                                           files: (m.files || []).map((f) => ({name: f.name, text: (f.text || "").slice(0, 524288)}))})));
 }
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
@@ -978,7 +1123,12 @@ $("chat").addEventListener("toggle", (e) => {
 
 function apiMessages() {
   const out = [];
-  for (const m of messages) {
+  // bound the API history to the last MAX_HISTORY messages (the full chat
+  // stays on screen): a long session with big attachments otherwise pushes
+  // the current question out of focus and slows every request
+  const MAX_HISTORY = 24;
+  const source = messages.length > MAX_HISTORY ? messages.slice(-MAX_HISTORY) : messages;
+  for (const m of source) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
       const text = userText(m);
@@ -998,8 +1148,11 @@ function assistantMessages(m) {
   // back as an assistant turn, so the history keeps alternating and a reasoning model sees that it already answered.
   // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
   if (!ran.length) {
-    const msg = {role: "assistant", content: m.text || ""};
-    if (!m.text && m.reasoning) msg.reasoning_content = m.reasoning;
+    // sm70: a turn that produced no answer text (error, or the old -n limit)
+    // would go back as content:"" + a reasoning blob; qwen3's template derails
+    // on those. Skip empty turns entirely — the visible chat keeps them.
+    if (!m.text) return [];
+    const msg = {role: "assistant", content: m.text};
     return [msg];
   }
   const out = [];
@@ -1050,9 +1203,10 @@ async function send() {
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
-  if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  // sm70: no MCP endpoint on llama-server; strata_mcp is never sent
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
+  const tSubmit = performance.now();
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
   try {
     const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
@@ -1080,6 +1234,16 @@ async function send() {
         try { j = JSON.parse(data); } catch (e) { continue; }
         if (j.error) throw new Error(j.error.message || "the engine reported an error");
         if (j.usage) usage = j.usage;
+    const fr = j.choices && j.choices[0] && j.choices[0].finish_reason;
+    if (fr === "length") m.hitLimit = true;
+        if (j.timings) usage = { ...(usage || {}), ...(j.timings.prompt_n != null ? {
+          prompt_n: j.timings.prompt_n, predicted_n: j.timings.predicted_n,
+          prompt_per_second: j.timings.prompt_per_second,
+          predicted_per_second: j.timings.predicted_per_second,
+          prompt_ms: j.timings.prompt_ms, predicted_ms: j.timings.predicted_ms,
+          draft_n: j.timings.draft_n, draft_n_accepted: j.timings.draft_n_accepted,
+          cache_n: j.timings.cache_n,
+        } : j.timings) };
         if (j.strata_mcp) onTool(m, j.strata_mcp);
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
@@ -1103,10 +1267,14 @@ async function send() {
     else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
   }
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
-  const n = usage ? usage.completion_tokens : null;
+  // llama-server answers a streaming request with `timings` (merged into usage above) and
+  // no `completion_tokens`; predicted_n is the generated-token count there.
+  const n = usage ? (usage.completion_tokens ?? usage.predicted_n) : null;
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
+    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}` +
+             (m.stopped ? " · stopped" : "") +
+             (m.hitLimit ? " · hit the server's max-token limit (-n); raise it or set Max tokens in the sampling drawer" : "") +
              (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
   } else if (m.stopped) {
     m.meta = "Stopped";
@@ -1122,13 +1290,16 @@ async function send() {
   saveChat();
   scrollDown();
   if (window.SM70) SM70.reportRequest({
-    prompt_n: usage ? usage.prompt_tokens : 0,
-    predicted_n: usage ? usage.completion_tokens : 0,
-    prompt_per_second: null,
-    predicted_per_second: (n && firstAt) ? n / ((performance.now() - firstAt) / 1000) : null,
-    prompt_ms: null, predicted_ms: null,
-    draft_n: usage && usage.draft_tokens, draft_n_accepted: usage && usage.draft_tokens_accepted,
-    cache_n: usage ? usage.prompt_tokens_cached : 0,
+    prompt_n: (usage && (usage.prompt_n ?? usage.prompt_tokens)) || 0,
+    predicted_n: (usage && (usage.predicted_n ?? usage.completion_tokens)) || 0,
+    prompt_per_second: usage ? usage.prompt_per_second : null,
+    predicted_per_second: usage ? usage.predicted_per_second : null,
+    prompt_ms: usage ? usage.prompt_ms : null,
+    predicted_ms: usage ? usage.predicted_ms : null,
+    ttft_ms: firstAt ? Math.round(firstAt - tSubmit) : null,
+    draft_n: (usage && usage.draft_n) || 0,
+    draft_n_accepted: (usage && usage.draft_n_accepted) || 0,
+    cache_n: (usage && (usage.cache_n ?? usage.prompt_tokens_cached)) || 0,
   });
 }
 
@@ -1158,7 +1329,7 @@ $("export-btn").onclick = () => {
     `## ${health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
-  a.download = `strata-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
+  a.download = `sm70-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 };
@@ -1239,10 +1410,30 @@ for (const id of ["chat", "composer"]) {
 }
 $("file").onchange = () => { addFiles($("file").files); $("file").value = ""; };
 $("input").addEventListener("paste", (e) => {
-  if (!health.images) return;
-  const files = [...(e.clipboardData || {}).files || []].filter((f) => f.type.startsWith("image/"));
-  if (files.length) { e.preventDefault(); addFiles(files); }
+  const dt = e.clipboardData;
+  if (!dt) return;
+  // copied pictures are not reliably in clipboardData.files (it depends on the
+  // app that copied them); the items list is the dependable place
+  let files = [...(dt.files || [])].filter((f) => f.type.startsWith("image/"));
+  if (!files.length) {
+    for (const it of dt.items || []) {
+      if (it.kind === "file" && it.type.startsWith("image/")) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+  }
+  if (!files.length) return;                  // a plain text paste: keep the default
+  e.preventDefault();
+  addFiles(files);        // it explains "Pictures are off" when no vision head is loaded
 });
+
+// sm70: the control-vector "speed projection" is a Strata engine feature; this
+// fork has no such input, so the toggle row stays hidden and the field never
+// reaches the request body.
+function projectionLoaded() {
+  return false;
+}
 
 // ------------------------------------------------------------------ the sampling drawer
 function openDrawer(open) {
@@ -1262,14 +1453,48 @@ function loadDrawer(s = settings) {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
   outputs();
 }
+function outputs() {
+  $("o-thinking").textContent = settings.thinking === "none" ? "off"
+    : settings.thinking === "xhigh" ? "high" : settings.thinking;
+  $("o-temp").textContent = fmt(settings.temperature, 2);
+  $("o-topp").textContent = fmt(settings.top_p, 2);
+  $("o-topk").textContent = fmt(settings.top_k, 0);
+}
+$("s-thinking").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-v]");
+  if (!b) return;
+  settings.thinking = b.dataset.v;
+  loadDrawer(); saveChat();
+});
+$("s-temp").oninput = (e) => { settings.temperature = +e.target.value; outputs(); };
+$("s-topp").oninput = (e) => { settings.top_p = +e.target.value; outputs(); };
+$("s-topk").oninput = (e) => { settings.top_k = +e.target.value; outputs(); };
+$("s-max").onchange = (e) => { settings.max = e.target.value; saveChat(); };
+$("s-seed").onchange = (e) => { settings.seed = e.target.value; saveChat(); };
+$("s-show").onclick = () => { settings.show = !settings.show; $("s-show").setAttribute("aria-checked", String(!!settings.show)); saveChat(); };
+$("s-apply").onclick = () => {
+  const sel = [...document.getElementById("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
+  settings = {thinking: sel ? sel.dataset.v : DEFAULTS.thinking, temperature: +document.getElementById("s-temp").value,
+              top_p: +document.getElementById("s-topp").value, top_k: +document.getElementById("s-topk").value,
+              max: document.getElementById("s-max").value.trim(), seed: document.getElementById("s-seed").value.trim(),
+              show: document.getElementById("s-show").getAttribute("aria-checked") === "true",
+              esp: false, mcp: false};
+  store.set("sampling", settings);
+  openDrawer(false);
+  const hint = document.getElementById("composer-hint");
+  hint.textContent = "Sampling updated · applies to the next message";
+  setTimeout(() => { hint.textContent = "Shift+Enter: new line"; }, 4000);
+};
+$("s-reset").onclick = () => { settings = {...DEFAULTS}; loadDrawer(); saveChat(); };
+$("sampling-btn").onclick = () => openDrawer(true);
+$("drawer-close").onclick = () => openDrawer(false);
+$("scrim").onclick = () => openDrawer(false);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
+
 // "Use for other apps too": the server keeps these settings as every client's defaults (GET/POST /settings)
 let sharedOn = false;
 async function loadShared() {
-  try {
-    const r = await fetch("settings", {headers: headers()});
-    if (r.ok) sharedOn = !!(await r.json()).shared;
-  } catch (e) { /* an older server: the switch just stays off */ }
-  $("s-share").setAttribute("aria-checked", String(sharedOn));
+  /* sm70: settings are local to this browser; the switch stays off */
 }
 function sharedDefaults(s) {
   const d = {reasoning_effort: s.thinking};
@@ -1281,62 +1506,8 @@ function sharedDefaults(s) {
   return d;
 }
 async function saveShared(on, s) {
-  const r = await fetch("settings", {method: "POST", headers: headers(true),
-                                      body: JSON.stringify({defaults: on ? sharedDefaults(s) : null})});
-  if (!r.ok) {
-    let msg = `HTTP ${r.status}`;
-    try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-    throw new Error(msg);
-  }
-  sharedOn = !!(await r.json()).shared;
+  /* sm70: settings stay in this browser */
 }
-// the engine was started with the experimental-speed-projection control vector (INFO cvec=...)
-function projectionLoaded() {
-  const c = lastMetrics && lastMetrics.engine ? lastMetrics.engine.cvec : 0;
-  return !!c && c !== "0";
-}
-function outputs() {
-  const t = +$("s-temp").value;
-  $("o-temp").textContent = t === 0 ? "0 · greedy" : t.toFixed(2);
-  $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
-  $("o-topk").textContent = $("s-topk").value;
-  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
-  for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
-}
-for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
-for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
-$("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
-$("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
-$("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
-$("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
-$("s-reset").onclick = () => loadDrawer(DEFAULTS);
-$("s-apply").onclick = async () => {
-  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
-              top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
-              show: $("s-show").getAttribute("aria-checked") === "true",
-              esp: $("s-esp").getAttribute("aria-checked") === "true",
-              mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
-  store.set("sampling", settings);
-  const share = $("s-share").getAttribute("aria-checked") === "true";
-  openDrawer(false);
-  if (share || sharedOn) {
-    try {
-      await saveShared(share, settings);
-      toast("success", "Sampling saved", share ? "Other apps (omp, API clients) use these settings from their next request."
-                                               : "Other apps use their own settings again.");
-    } catch (e) {
-      toast("error", "Saved here, but not for other apps", e.message, 6000);
-    }
-    return;
-  }
-  toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
-};
-$("sampling-btn").onclick = () => openDrawer(true);
-$("drawer-close").onclick = () => openDrawer(false);
-$("scrim").onclick = () => openDrawer(false);
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
 
 // ------------------------------------------------------------------ start
 setBusy(false);
@@ -1379,3 +1550,81 @@ $("img-form").onsubmit = async (ev) => {
     $("img-go").disabled = false;
   }
 };
+
+// ------------------------------------------------------------------ shared UI state
+// Everything above reads its first value from localStorage. This brings the
+// launcher's copy in: if the shared file does not exist yet it is seeded from this
+// client (migration for an existing browser profile), otherwise the launcher wins
+// and the page repaints. Writes from store.set() go back to the file, and a focus
+// after another client changed something adopts that.
+function adoptUiState(s, keepChat) {
+  if (!s || typeof s !== "object") return;
+  if (s.theme === "light" || s.theme === "dark") {
+    setTheme(s.theme, false);
+    try { localStorage.setItem("strata.theme", s.theme); } catch (e) { /* ignore */ }
+  }
+  if (s.lang && window.SM70I18n) {
+    SM70I18n.setPref(s.lang, false);
+    try { localStorage.setItem("strata.lang", s.lang); } catch (e) { /* ignore */ }
+    const picker = $("lang-select");
+    if (picker) picker.value = s.lang;
+  }
+  if (typeof s.apikey === "string") {
+    store.cache("apikey", s.apikey);
+    const input = $("api-key");
+    if (input) input.value = s.apikey;
+  }
+  if (s.sampling && typeof s.sampling === "object") {
+    settings = {...settings, ...s.sampling};
+    store.cache("sampling", settings);
+    loadDrawer();
+  }
+  if (Array.isArray(s.chat) && !busy && !keepChat) {      // never rewrite an active conversation
+    messages = s.chat;
+    store.cache("chat", messages);
+    renderChat();
+  }
+}
+async function syncUiState(first) {
+  const localLen = messages.length;           // before the round trip: did the user type?
+  try {
+    const r = await fetch("ui-state");
+    if (!r.ok) return;                        // page served without the launcher
+    const j = await r.json();
+    const s = j.state || {};
+    if (!Object.keys(s).length) {
+      // no shared file yet: seed it from this client's cache when there is something
+      // to keep. A client with nothing to say leaves the file absent, so a client
+      // that does have history is still the one that seeds it.
+      const seed = {chat: store.get("chat", []), sampling: store.get("sampling", {}),
+                    apikey: store.get("apikey", "")};
+      let theme = ""; try { theme = localStorage.getItem("strata.theme") || ""; } catch (e) { /* ignore */ }
+      if (theme === "light" || theme === "dark") seed.theme = theme;
+      seed.lang = window.SM70I18n ? SM70I18n.pref() : "system";
+      const hasData = seed.chat.length || seed.apikey || Object.keys(seed.sampling).length;
+      if (hasData) {
+        const w = await fetch("ui-state", {method: "POST", headers: {"Content-Type": "application/json"},
+                                           body: JSON.stringify(seed)});
+        if (w.ok) { const wj = await w.json(); if (wj.at) uiStateAt = wj.at; }
+      }
+      store.ready = true;
+      return;
+    }
+    if (first || (j.at || 0) > uiStateAt) {   // another client wrote since we looked
+      let typedWhileFetching = false;
+      if (first && Array.isArray(s.chat) && messages.length > localLen) {
+        // the user sent a message before the fetch returned: theirs is newer than
+        // the file, so publish it instead of replacing their screen
+        typedWhileFetching = true;
+      }
+      adoptUiState(s, typedWhileFetching);
+      uiStateAt = j.at || Date.now();
+      store.ready = true;
+      if (typedWhileFetching) store.set("chat", messages);   // now allowed to POST
+      return;
+    }
+    store.ready = true;
+  } catch (e) { /* no launcher: localStorage-only behaviour, exactly as before */ }
+}
+syncUiState(true);
+window.addEventListener("focus", () => { if (!busy) syncUiState(false); });

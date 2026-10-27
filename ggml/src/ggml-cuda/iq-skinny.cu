@@ -14,11 +14,13 @@
 // Enable/disable: env LLAMA_SM70_IQ_SKINNY=0 disables (A/B benchmarking); default on.
 // Volta only, like the rest of the skinny family.
 
-#define IQ_SKINNY_LUT_DEFINE 1
 #include "iq-skinny.cuh"
 #include "convert.cuh"
 #include "q4k-skinny.cuh"
 
+#include <cmath>
+#include <cstdio>
+#include <algorithm>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -126,10 +128,12 @@ void ggml_cuda_iq_skinny_repack(ggml_backend_cuda_context & ctx, ggml_tensor * t
 
     // design-B decodes read the f16 grid / sign-mask LUTs; build them once per process
     {
-        static bool lut_ready = false;
-        if (!lut_ready) {
+        // the LUT is per-device memory, so the flag has to be per device too
+        static bool lut_ready[GGML_CUDA_MAX_DEVICES] = {};
+        const int lut_dev = ggml_cuda_get_device();
+        if (!lut_ready[lut_dev]) {
             iq_skinny_init_lut(ctx.stream());
-            lut_ready = true;
+            lut_ready[lut_dev] = true;
         }
     }
 
@@ -142,6 +146,45 @@ void ggml_cuda_iq_skinny_repack(ggml_backend_cuda_context & ctx, ggml_tensor * t
 
     ggml_cuda_q4k_skinny_repack_side(t->type, t->data, entry->data, entry->data + codes_bytes,
                                     n, k, ctx.stream());
+
+    // temporary parity probe: does the side buffer + to_f16 expansion reproduce the
+    // stock dequant of the same tensor? prints the worst mismatch and its location
+    static bool parity_done[GGML_TYPE_COUNT] = {};
+    if (!parity_done[t->type] && getenv("LLAMA_SM70_IQ_PARITY") != nullptr) {
+        parity_done[t->type] = true;
+        const int64_t ne = n * (int64_t) k;
+        std::vector<half> ha(ne), hb(ne);
+        half * da = nullptr;
+        half * db = nullptr;
+        CUDA_CHECK(cudaMalloc(&da, ne * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&db, ne * sizeof(half)));
+        ggml_cuda_q4k_skinny_to_f16_codes(t->type, entry->data, da, (int) n, (int) k, ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+        const to_fp16_cuda_t stock = ggml_get_to_fp16_cuda(t->type);
+        GGML_ASSERT(stock != nullptr);
+        stock(t->data, db, ne, ctx.stream());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(ha.data(), da, ne * sizeof(half), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hb.data(), db, ne * sizeof(half), cudaMemcpyDeviceToHost));
+        double worst = 0.0;
+        int64_t worst_i = -1, nbad = 0;
+        for (int64_t i = 0; i < ne; ++i) {
+            const double a = __half2float(ha[i]);
+            const double b = __half2float(hb[i]);
+            const double d = std::fabs(a - b);
+            if (d > 1e-3 * std::max(1.0, std::fabs(b))) { ++nbad; }
+            if (d > worst) { worst = d; worst_i = i; }
+        }
+        const int64_t row = worst_i / k, col = worst_i % k;
+        fprintf(stderr, "[iqparity] %s n=%d k=%d ntiles=%d nbad=%lld/%lld worst=%.6g "
+                        "at row=%lld col=%lld (expansion=%.6g stock=%.6g)%c",
+                ggml_type_name(t->type), (int) n, (int) k, (int) (n / 32),
+                (long long) nbad, (long long) ne, worst, (long long) row, (long long) col,
+                worst_i >= 0 ? __half2float(ha[worst_i]) : 0.0,
+                worst_i >= 0 ? __half2float(hb[worst_i]) : 0.0, 10);
+        CUDA_CHECK(cudaFree(da));
+        CUDA_CHECK(cudaFree(db));
+    }
 
     {
         std::lock_guard<std::mutex> lock(iq_skinny_mutex);

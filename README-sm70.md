@@ -235,6 +235,8 @@ llama.cpp native path automatically — no config needed.
 | `-ub 16384` | OOM; 8192 is the prefill optimum (prefill is dequant-bound per ubatch) |
 | `LLAMA_SM70_SKINNY=2` on one card | OOM (second weight copy); TP2-only |
 | `q4-direct` as default | 42% slower kernel at 174k (narrow u16 loads); opt-in for VRAM only |
+| `-np > 1` (several sequences in one ubatch) | the D256 kernel implements a single-sequence causal mask (it probes the last mask row for the live prefix). It now falls back on its own: with per-sequence caches a mixed batch has `ne[3] != 1` and is rejected; with a unified cache and more than one slot the server sets `LLAMA_SM70_D256_MULTI_SEQ=1` and the whole process stays on the stock path. Single-sequence batches keep the kernel |
+| a model with Q8_0 weights + `LLAMA_SM70_SKINNY=2` | there is no Q8_0 codec on the side-buffer route, and the load asserts; keep `SKINNY=0/1` or use another quant |
 | `-O3 --use_fast_math` style kernel tweaks | already at the accumulator-chain limit, see the ceiling section |
 
 ## Environment variables
@@ -249,7 +251,9 @@ llama.cpp native path automatically — no config needed.
 | `LLAMA_SM70_D256_DEC_Q4` | `0` | q4_0 direct loads in the decode kernel |
 | `LLAMA_SM70_D256_SPLITS` | `0` | Decode KV-split cap override (`0` = auto `kv_len/920`, cap 48; max 256) |
 | `LLAMA_SM70_DEQUANT_FAST` | `1` | sm_70 iq3_s/iq3_xxs/iq4_xs dequant kernels; `0` = stock dequant |
-| `LLAMA_SM70_SKINNY` | `0` | q4_K skinny path: `1` = in-place repack (no copy), `2` = second weight copy (+1.1 GB/card here). Also the gate for `IQ_SKINNY`. See "Concurrency-first variant" for the measured trade |
+| `LLAMA_SM70_D256_MULTI_SEQ` | set by the server | llama-server sets it to `1` for a unified KV cache with more than one slot; the D256 kernels are then disabled process-wide (they implement a single-sequence causal mask). Set it yourself when embedding another frontend |
+| `LLAMA_SM70_IQ_PARITY` | `0` | `1` = on the first repack, dequantize one tensor of each type both through the side buffer and through the stock kernel and compare value by value; prints `nbad` (this is how the 10/26 all-zero IQ3_S weights were found) |
+| `LLAMA_SM70_SKINNY_DEBUG_STOCK` | `0` | Debug split: `1` = force IQ types onto the stock path, `2` = force k-quant types onto the stock path |: `1` = in-place repack (no copy), `2` = second weight copy (+1.1 GB/card here). Also the gate for `IQ_SKINNY`. See "Concurrency-first variant" for the measured trade |
 | `LLAMA_SM70_IQ_SKINNY` | `0` | IQ repack: +4% prefill @174k, **no decode change**, +3.8 GB/card of side buffers. Only takes effect when `LLAMA_SM70_SKINNY != 0` |
 | `LLAMA_SM70_D256_DEBUG` | `0` | Print kernel selection probes (ACCEPT/REJECT + reason) |
 | `GGML_CUDA_P2P_AR_MAX_BYTES` | `176 MiB` | One-shot P2P allreduce message window; `0` disables that path |
@@ -313,6 +317,37 @@ KV cache can store neither shape.
 noise block at the draft cache's own `pos_max + 1`; demote the pos_max-vs-N
 warning to a debug heuristic. The target still validates every drafted token, so
 the output distribution stays exact.
+
+### All-zero IQ3_S weights (10/26) — a cross-TU device symbol
+
+**Symptoms**: under `SKINNY=2 + IQ_SKINNY=1`, every prompt longer than ~128
+tokens was answered as if the user had said nothing: the model repeated an
+earlier answer, claimed not to see the attachment, or answered a different
+question. Short chats were fine, which is why nobody suspected the weights.
+
+**Root cause**: the design-B decode of IQ3_S reads a f16 grid table
+(`iq3s_grid_f16`). The table was defined and initialized in `iq-skinny.cu`,
+but the expansion kernel that consumes it is instantiated in `q4k-skinny.cu`.
+This tree builds without relocatable device code (no `-rdc`), so the
+`extern __device__` reference never binds to the definition — that TU read an
+all-zero table. Every IQ3_S weight then expanded to 0.0, and since the FFN of
+this model is 144 IQ3_S tensors, only the system prompt was left to attend to.
+The M<=64 route-around uses the original bytes, so short prompts were
+unaffected and only long ones broke.
+
+**Diagnosis**: `LLAMA_SM70_IQ_PARITY=1` dequantizes one tensor both through
+the side buffer and through the stock kernel and compares value by value on
+the host — `iq3_s nbad = 52,420,257 / 52,428,800`, all zeros. The
+`LLAMA_SM70_SKINNY_DEBUG_STOCK` three-way split pinned the codec: forcing only
+the IQ types back to the stock path restored correct answers, forcing the
+k-quants did not.
+
+**Fix**: internal linkage for the tables (one copy per TU) plus a lazy init in
+the TU that launches the decode kernels (`6cb842973`). Parity is now
+`nbad = 0`; sentinel retrieval passes at 137 / 408 / 1201-token prompts, and a
+2.4 KB attachment is answered from its own content, follow-up included.
+Re-measured after the fix, IQ_SKINNY still pays: 1480 vs 1433 t/s at a 1k
+prompt and 1891 vs 1858 t/s at 8.2k, for the documented +7.3% VRAM.
 
 ### Nondeterminism at ≥30k (10/26) — two independent root causes
 
@@ -454,13 +489,112 @@ Everything is self-contained and runs on the physical box.
   `dump_*.sh` — the 8/23 three-way blame kit;
 - `logit_ab_fixed.sh`, `perf_ab*.sh` — logit verdict and throughput acceptance.
 
+`tools/sm70gui/` + `tools/webui/` — the local launcher and UI:
+
+- four tabs (Chat / Monitor / About / **Launch**) served by `sm70gui.py`, which
+  also proxies the API (SSE relayed chunk by chunk), reports GPU/host telemetry
+  and owns the server lifecycle;
+- the Launch tab has no preset profiles: the model and the basic arguments
+  (context, slots, KV types, speculation, threads …) are plain fields, anything
+  else goes in one free-text argument line, and every environment variable is a
+  row in the table (names and defaults come from the source,
+  `tools/sm70gui/sm70_config.py`);
+- the launcher only derives what it can **measure**: the GGUF header (arch,
+  layers, quant mix, MTP layers) and the compute capability the driver API
+  reports (cc 7.0 = SM70). Device switches select cards and
+  `CUDA_VISIBLE_DEVICES` is built from them — SM70 only; non-SM70 cards get no
+  switch;
+- the variables are split in two tiers: nine common ones are listed directly and
+  the rest (TP2 / upstream / debug) sit in a folded "advanced" section with a
+  do-not-touch note; every row carries an English and a Chinese description;
+- the UI language follows the system (About can force English / 简体中文) and
+  switches without a reload;
+- a choice that cannot act is reported with a reason (e.g. `IQ_SKINNY` without IQ
+  tensors, speculation without MTP layers), and the command preview exports
+  exactly the environment the launcher will exec.
+
 `bench/` — workloads and measurement:
 - `prompt_46k.txt`, `prompt_176k.txt` — standard / ROI prefill workloads;
 - `perf-2026-10-26-tp2.csv` — the TP2 sweep in the table above;
 - `plot_sm70_perf.py` + `shot_chart.bat` — dependency-free chart generator
   (HTML+SVG) and the headless-browser rasterizer;
-- `D:\zcode-build\sweep_perf.py`-style sweeps live outside the repo (they need
+- `a sweep script kept outside the repo`-style sweeps live outside the repo (they need
   the model and the servers).
+
+## Windows GUI (sm70gui)
+
+Ready to run: `tools\sm70gui\sm70gui.exe` **ships in the repository** - no Python,
+no packaging step. Double-click it and you get **its own application window** (a
+WebView2 host), and it **never opens a browser tab**; the page is still served at
+`http://127.0.0.1:8199/` if you want one (type it yourself, or use the tray's
+"在浏览器中打开 / Open in browser").
+
+One PC, one configuration: the chat, the sampler, the API key, the theme and the
+language are stored by the launcher (`sm70gui-ui.json`, beside
+`sm70gui-config.json`), so the app window, Edge or any other browser on the same
+address share one copy - change it in one and the other picks it up on the next
+load (or when its window regains focus). The launch settings (model, arguments,
+environment, devices) were already a single file. The page's localStorage is only
+a local cache for the first paint.
+
+Closing the window **minimizes to the tray** by default: the launcher, the chat and
+the llama-server it started keep running, "显示 / Show" in the tray restores the
+window, and "退出 / Quit" ends the process (and stops that server). **About ->
+Settings** has the switch ("Closing the window keeps the launcher in the tray",
+on by default); turn it off and X quits directly. The same card has "Load the saved
+model when the launcher starts" (off by default): with it on, a double-click loads
+the model the form last saved; `--autostart` / `--no-autostart` override it for one
+run.
+
+A second double-click does not start a second instance: it brings the existing
+window up (a headless copy tells you which URL to open). `--no-browser` serves only,
+with no window. The windowed build has no console; startup lines go to
+`%TEMP%\sm70gui-launcher.log` and the server's own log to
+`%TEMP%\sm70gui-server.log`, so those are the first places to look.
+
+It is not another server: one local process serves the page on `127.0.0.1`,
+proxies llama-server's API (streaming replies are relayed chunk by chunk) and owns
+the llama-server lifecycle. Everything stays on the loopback interface.
+
+### First run
+
+1. Build this tree first (`cmake --build build`); the GUI looks for
+   `<repo>\build\bin\llama-server.exe` by itself. Somewhere else? Pass
+   `--server-exe <path>`. `--gui-port` moves the UI, `--config` moves the settings
+   file (default: next to llama-server);
+2. the **Launch** tab: `Browse…` for the model folder (changing it rescans), then
+   pick the file. A local `.gguf` goes to `-m`, a `user/repo[:quant]` value goes to
+   `-hf`. Vision head -> `--mmproj`, standalone draft model -> `--spec-draft-model`,
+   display name -> `--alias`;
+3. **Devices**: the list is what the CUDA driver reports, and only cards with
+   compute capability 7.0 (SM70) get a switch. `CUDA_VISIBLE_DEVICES` is composed
+   from those switches in CUDA's order (not nvidia-smi's); other cards are shown as
+   unsupported;
+4. **Server arguments** cover `-c/-np/-b/-ub/-t/-tb/-ngl/-sm/-fa/-ctk/-ctv/--port/
+   --cache-ram/--spec-type/--spec-draft-n-max/--temp/--top-p/--top-k/--min-p/-n`;
+   anything else goes into "Extra arguments";
+5. **Environment**: nine common variables are listed, the rest sit in a folded
+   "Advanced" section, each with the code default and a bilingual description. The
+   switches are exactly what gets exported, and the command preview below shows
+   only what differs from the defaults;
+6. press **Start** to (re)load after a parameter change; a saved model is already
+   loaded on double-click. Startup progress and the server log are on the same
+   page, and `Stop` only stops a server this process spawned.
+
+Edits are saved as you type (500 ms after the last keystroke) and the status line
+shows when and where. **Reset everything** deletes the settings file. The
+**Config files** card stores the current form under a name, loads it back, renames,
+deletes, or exports/imports it as JSON anywhere. The UI language follows the system
+(About can force English / 简体中文) and the theme follows `data-theme`.
+
+Tabs: `Chat` streams tokens, times thinking and the first token, takes text
+attachments and has a sampling drawer; `Monitor` polls llama-server's `/metrics`
+and `/slots` plus local CPU/RAM/disk once a second; `About` shows the running
+model, the machine and what the form is about to start; `Launch` is the form above.
+
+(Maintainers: after changing `tools/sm70gui/` or `tools/webui/`, run
+`build_exe.bat`; it rebuilds the exe and refreshes the tracked
+`tools/sm70gui/sm70gui.exe`, which is committed so a clone runs as-is.)
 
 ## Repository layout
 

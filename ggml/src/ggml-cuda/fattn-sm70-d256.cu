@@ -158,6 +158,16 @@ static void sm70_d256_dequant_kv(
     }
 }
 
+// Set by the server when a unified KV cache runs more than one slot: a mixed ubatch then
+// breaks the single-sequence causal assumption the kernels are built on.
+static bool sm70_multi_seq_hint() {
+    static const bool multi = [] {
+        const char * e = getenv("LLAMA_SM70_D256_MULTI_SEQ");
+        return e && e[0] == '1';
+    }();
+    return multi;
+}
+
 static bool sm70_env_disabled() {
     static const bool disabled = [] {
         const char * e = getenv("LLAMA_SM70_D256");
@@ -502,6 +512,11 @@ static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context 
 
 // ------------------------------------------------------------------- public
 bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
+    if (cc == GGML_CUDA_CC_VOLTA && sm70_multi_seq_hint() && dst->src[3] != nullptr) {
+        sm70_d256_probe("REJECT: unified KV with >1 slots (server hint)", cc,
+                        dst->src[0], dst->src[1], dst->src[2], dst->src[3]);
+        return false;
+    }
     if (cc != GGML_CUDA_CC_VOLTA || sm70_env_disabled()) {
         // probe only when cc is volta (the interesting case for the probe)
         if (cc == GGML_CUDA_CC_VOLTA) {
@@ -533,7 +548,7 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
         // (measured -3..-6% for the TC kernel at width 1); the TC kernel owns
         // verify widths w>=2 where GQA row packing + tensor-core math pay
         // (measured +20.5% (f16 V) / +30.8% (q4 V) at 174k spec-verify).
-        const bool ok_d = Q->ne[1] >= 2 && Q->ne[1] <= 8 && mask && Q->ne[3] == 1
+        const bool ok_d = Q->ne[1] >= 2 && Q->ne[1] <= 8 && mask && Q->ne[3] == 1 && K->ne[3] == 1
                        && Q->ne[2] % K->ne[2] == 0 && (gqa_d == 6 || gqa_d == 8) && kv_ok_d;
         if (ok_d) {
             sm70_d256_probe("ACCEPT: sm70 d256 decode kernel", cc, Q, K, V, mask);
@@ -546,6 +561,12 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     }
     if (!mask || mask->ne[0] < 256 || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches -> stock
         sm70_d256_probe("REJECT: no mask or small batch", cc, Q, K, V, mask);
+        return false;
+    }
+    if (Q->ne[3] != 1 || K->ne[3] != 1) {
+        // per-stream caches: the kernel carries one KV base (k_outer_stride is 0), so
+        // every stream would attend to stream 0's keys. Route to stock instead.
+        sm70_d256_probe("REJECT: multi-stream batch", cc, Q, K, V, mask);
         return false;
     }
     if (Q->ne[1] > mask->ne[0]) { // kv_len (mask->ne[0]) must cover q_len
@@ -629,6 +650,11 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
         if (sm70_d256_decode_enabled() && Q->ne[0] == SM70_D256_D
                 && Q->ne[1] >= 1 && Q->ne[1] <= 8 && Q->ne[3] == 1) {
             const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+            // MUST be the same predicate the decode launcher uses (it decides with
+            // sm70_d256_dec_q4_direct / LLAMA_SM70_D256_DEC_Q4, independent of the
+            // prefill-side Q4_DIRECT). Any disagreement reserves a different amount of
+            // f16 mirror than the launcher carves, and the launcher then writes Qs/Os/
+            // partials past the node's allocation (16.8 MB at kv_len 8192, hkv 4).
             const bool k_dir = K->type == GGML_TYPE_Q4_0 && sm70_d256_dec_q4_direct();
             const bool v_dir = V->type == GGML_TYPE_Q4_0 && sm70_d256_dec_q4_direct();
             const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
@@ -694,10 +720,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     const int gqa    = (int) (Q->ne[2] / K->ne[2]);
     const int q_len  = (int) Q->ne[1];
     const ggml_tensor * mask = dst->src[3];
+    GGML_ASSERT(mask != nullptr);
     // REAL KV length is mask->ne[0] (mask built as [n_kv, q_len]); K->ne[1] is the FULL cache size.
     const int kv_len = (int) mask->ne[0];
     const int nb     = (int) Q->ne[3];
-    GGML_ASSERT(mask != nullptr);
     // NOTE (8/19 crash post-mortem): K and V types are legitimately
     // different (-ctk q4_0 -ctv f16): the dequant path handles each
     // independently. Do NOT assert K->type == V->type.
@@ -863,8 +889,11 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     const int k_mode = k_direct ? (K->type == GGML_TYPE_Q4_0 ? 1 : 2) : 0;
     const int v_mode = v_direct ? (V->type == GGML_TYPE_Q4_0 ? 1 : 2) : 0;
 
-    static bool smem_raised = false;
-    if (!smem_raised) {
+    // cudaFuncSetAttribute is per device; a process-global flag leaves every other GPU
+    // without the raised limit. Benign only while kSmemBytes stays under the 48 KB default.
+    static bool smem_raised[GGML_CUDA_MAX_DEVICES] = {};
+    const int smem_dev = ggml_cuda_get_device();
+    if (!smem_raised[smem_dev]) {
         for (int i = 0; i < 3; ++i) {
             for (int j = 0; j < 3; ++j) {
                 CUDA_CHECK(cudaFuncSetAttribute((const void *) kfn_dense[i][j],
@@ -873,7 +902,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                     cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
             }
         }
-        smem_raised = true;
+        smem_raised[smem_dev] = true;
     }
 
     static const int splitkv3_min_kv = [] {

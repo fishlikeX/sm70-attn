@@ -30,17 +30,20 @@
 #include "common.cuh"
 #include "q-skinny-common.cuh"
 
-// ---- one-time LUTs for design B (built by iq_skinny_init_lut, 4 KB + 128 B) ----
+// ---- design-B f16 LUTs (4 KB + 128 B), one copy per translation unit ----
+//
+// The IQ3_S decode kernel (qskinny_to_f16_kernel<GGML_TYPE_IQ3_S>) is instantiated in
+// q4k-skinny.cu while the repack lives in iq-skinny.cu. This tree builds without
+// relocatable device code, so a __device__ global DEFINED in one TU is NOT the object
+// another TU reads through `extern`: the expansion kernel saw an all-zero table and
+// turned every IQ3_S weight into 0 (2026-10-26: 52,420,257 / 52,428,800 values wrong,
+// all zeros; prompts past ~128 tokens then answered as if the user text were absent).
+// Internal linkage gives each TU its own copy; the decoding TU initializes its own
+// with iq_skinny_init_lut() before the first launch.
+static __device__ unsigned long long iq3s_grid_f16[512];
+static __device__ unsigned long long iq3s_sign_mask16[16];
 
-// iq3s_grid entry (4 byte values in {1,3,...,15}) pre-converted to 4 f16 halves;
-// 4-bit sign pattern -> four f16 sign bits. Defined once (iq-skinny.cu sets
-// IQ_SKINNY_LUT_DEFINE before including this header; standalone device tests may
-// define their own copy), extern everywhere else.
-#if defined(IQ_SKINNY_LUT_DEFINE)
-__device__ unsigned long long iq3s_grid_f16[512];
-__device__ unsigned long long iq3s_sign_mask16[16];
-
-__global__ void iq_skinny_init_lut_kernel() {
+static __global__ void iq_skinny_init_lut_kernel() {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < 512) {
         const uint8_t * g = (const uint8_t *) (iq3s_grid + i);
@@ -60,13 +63,8 @@ __global__ void iq_skinny_init_lut_kernel() {
         iq3s_sign_mask16[i] = m;
     }
 }
-#else
-extern __device__ unsigned long long iq3s_grid_f16[512];
-extern __device__ unsigned long long iq3s_sign_mask16[16];
-__global__ void iq_skinny_init_lut_kernel();
-#endif
 
-// must run once per process before any design-B decode
+// must run once per TU before any design-B decode on that stream
 inline void iq_skinny_init_lut(cudaStream_t stream) {
     iq_skinny_init_lut_kernel<<<2, 256, 0, stream>>>();
 }

@@ -217,6 +217,8 @@ LLAMA_SM70_D256_DEC_Q4=1 \
 | `-ub 16384` | OOM；8192 是预填充最优（预填充受每 ubatch 去量化限制） |
 | 单卡开 `LLAMA_SM70_SKINNY=2` | OOM（第二份权重拷贝），TP2 专用 |
 | 把 `q4-direct` 设默认 | 174k 下 kernel 慢 42%（窄 u16 载入）；只在显存吃紧时开 |
+| `-np > 1`（多序列同批） | D256 内核只实现单序列因果（因果基准由最后一行 mask 前缀探测）。现在**自动回落**：per-seq 缓存下混批的 `ne[3] != 1` 会被门禁拒绝；unified 缓存 + >1 槽由服务端置 `LLAMA_SM70_D256_MULTI_SEQ=1`，整进程走 stock。单序列批仍走内核 |
+| 含 Q8_0 权重的模型 + `LLAMA_SM70_SKINNY=2` | Q8_0 没有侧缓冲编解码，加载时会断言退出；保持 `SKINNY=0/1` 或换量化 |
 | 各种 kernel 编译选项微调 | 已经撞到累加器链上限，见「剩下的时间花在哪」 |
 
 ## 环境变量
@@ -234,6 +236,9 @@ LLAMA_SM70_D256_DEC_Q4=1 \
 | `LLAMA_SM70_SKINNY` | `0` | q4_K 瘦身路径：`1` = 原地重排（不复制），`2` = 多一整份权重拷贝（本机 +1.1 GB/卡）。同时是 `IQ_SKINNY` 的开关前提。实测代价见「并发优先变体」 |
 | `LLAMA_SM70_IQ_SKINNY` | `0` | IQ 重排：174k 预填充 +4%、**解码不变**、side buffer +3.8 GB/卡。仅在 `LLAMA_SM70_SKINNY != 0` 时生效 |
 | `LLAMA_SM70_D256_DEBUG` | `0` | 打印 kernel 选择探针（ACCEPT/REJECT + 原因） |
+| `LLAMA_SM70_D256_MULTI_SEQ` | 由服务端设置 | unified KV + >1 槽时由 llama-server 置 `1`，整进程停用 D256 内核（内核只实现单序列因果）。手动跑其他前端时可自行设置 |
+| `LLAMA_SM70_IQ_PARITY` | `0` | `1` = 首次 repack 时把每个类型的一个张量分别用侧缓冲展开和 stock kernel 去量化、逐值比对，打印 `nbad`（10/26 的 IQ3_S 全零权重就是这么定位的） |
+| `LLAMA_SM70_SKINNY_DEBUG_STOCK` | `0` | 调试切分：`1` = IQ 类张量强制走原始路径，`2` = k-quant 类走原始路径 |
 | `GGML_CUDA_P2P_AR_MAX_BYTES` | `176 MiB` | 单发 P2P allreduce 的消息窗口；`0` 关闭该路径 |
 | `GGML_CUDA_P2P_AR_NBLOCKS` | `80` | allreduce block 数（≤ 每 SM 一个，超了会死锁） |
 | `LLAMA_SM70_GDN_PROLOGUE` | `0` | GDN l2norm prologue 融合（逐位精确；`_DBG=1` 匹配诊断，`_NOCACHE=1` 关 cpy 折叠） |
@@ -289,6 +294,30 @@ target 的 M-RoPE 里），而后续文本从 `image_pos + grid_height` 继续�
 在下一个 token batch 到达时用零特征行补洞；`draft()` 把噪声块放在草稿缓存自己
 的 `pos_max + 1`；把 pos_max-vs-N 的警告降级为调试启发式。target 仍然验证每个
 草稿 token，输出分布保持不变。
+
+### IQ3_S 权重全零（10/26）——跨 TU 设备符号
+
+**症状**：`SKINNY=2 + IQ_SKINNY=1` 下，超过约 128 token 的提示被当成"用户没说话"：
+模型复述上一轮答案、声称没看到附件、把别处的回答搬过来。短对话完全正常，所以
+一直没人怀疑到权重上。
+
+**根因**：IQ3_S 的 design-B 解码要读一张 f16 网格表 `iq3s_grid_f16`。这张表在
+`iq-skinny.cu` 里定义并初始化，但消费它的展开 kernel 实例化在 `q4k-skinny.cu`。
+本树 CUDA 构建**没有开 relocatable device code**（无 `-rdc`），`extern __device__`
+在另一个 TU 里绑不到定义——那个 TU 读到的是一张全零表。于是每个 IQ3_S 权重都
+展开成 0.0，模型（FFN 主体正是 144 个 IQ3_S 张量）只剩 system 提示可看。
+M≤64 的旁路用的是原始字节，所以短提示不受影响，只有长提示会炸。
+
+**诊断**：`LLAMA_SM70_IQ_PARITY=1` 把同一张量分别用侧缓冲展开和 stock kernel
+去量化、在 host 上逐值比对——`iq3_s nbad = 52,420,257 / 52,428,800`（全部为零）；
+再配合 `LLAMA_SM70_SKINNY_DEBUG_STOCK` 三向切分（只把 IQ 类张量强制回原始路径
+即恢复正常，强制 k-quant 类则不然）定位到 IQ 编解码。
+
+**修复**：表改成 header 里的内部链接（每个 TU 各持一份），由启动解码 kernel 的
+TU 在首次使用前初始化自己那份（`6cb842973`）。修复后 `nbad = 0`；137 / 408 /
+1201 token 的哨兵检索全部通过，2.4 KB 附件的问答和追问都从文件内容作答。
+修复后复测预填充：IQ_SKINNY 仍然值得开（1k 提示 1480 vs 1433 t/s，8.2k 提示
+1891 vs 1858 t/s），代价仍是 +7.3% 显存。
 
 ### ≥30k 的不确定性（10/26）——两个独立根因
 
@@ -411,12 +440,91 @@ CTA 会让 SM 网格闲着。三层工作解决了它：D256 张量核心解码 
   `dump_*.sh` —— 8/23 的三方归因工具包；
 - `logit_ab_fixed.sh`、`perf_ab*.sh` —— logit 裁决与吞吐验收。
 
+`tools/sm70gui/` + `tools/webui/` —— 本地 launcher 与 UI：
+
+- Chat / Monitor / About / **Launch** 四个页签，`sm70gui.py` 一个进程同时做静态 UI、
+  API 代理（SSE 逐块转发）、GPU/主机遥测和服务生命周期；
+- Launch 页签没有"预设档位"：模型、基础参数（上下文/并行槽/KV 类型/投机/线程…）
+  直接填，其余命令行参数用一条自由文本追加，环境变量则在完整表格里逐项开关
+  （清单与默认值来自源码，`tools/sm70gui/sm70_config.py`）；
+- launcher 只自动推导它能**测到**的东西：GGUF 头里的 arch/层数/量化构成/MTP 层，
+  以及 CUDA 驱动 API 读到的计算能力（cc 7.0 = SM70）。设备按卡开关，
+  `CUDA_VISIBLE_DEVICES` 由开关拼出、只含 SM70 卡；非 SM70 卡不给开关；
+- 环境变量分两档：常用 9 个直接列出，其余（TP2/上游/调试）收进折叠的「高级」区
+  并注明"非必要不调整"；每条都带英文说明 + 中文说明；
+- 界面语言跟随系统（About 里可强制 English / 简体中文），切换即时生效；
+- 选择会让某个开关失效时会给出原因（没有 IQ 张量的 `IQ_SKINNY`、没有 MTP 层的投机），
+  命令行预览导出的环境与真正 `exec` 的完全一致。
+
 `bench/` —— 负载与测量：
 - `prompt_46k.txt`、`prompt_176k.txt` —— 标准 / ROI 预填充负载；
 - `perf-2026-10-26-tp2.csv` —— 上表的 TP2 原始数据；
 - `plot_sm70_perf.py` + `shot_chart.bat` —— 零第三方依赖的图表生成器
   （HTML+SVG）与无头浏览器截图脚本；
 - 跨上下文扫描脚本（`sweep_perf.py` 一类）放在仓库外，因为需要模型和起服务。
+
+## Windows 图形界面（sm70gui）
+
+开箱即用：`tools\sm70gui\sm70gui.exe` **已经打包好放在仓库里**，不需要装 Python、
+也不需要自己打包。双击后是它**自己的应用窗口**（内嵌 WebView2），**不会再拉起浏览器
+标签页**；网页仍然在 `http://127.0.0.1:8199/`，想用浏览器看就自己输这个地址（托盘
+菜单里也有“在浏览器中打开 / Open in browser”）。
+
+同一台电脑只有**一份配置**：对话、采样设置、API key、主题和语言都由 launcher 统一
+保存（`sm70gui-ui.json`，和 `sm70gui-config.json` 同目录），窗口端、Edge 或任何其他
+浏览器打开同一个地址看到的是同一份，改哪边另一边下次打开/切回来都会同步；模型路径、
+参数、环境变量、设备这些启动配置也在同一目录的 `sm70gui-config.json` 里，本来就只有
+一份。页面自己的 localStorage 只是本机缓存，用来让首个画面不用等网络。
+
+关窗口默认**最小化到托盘**（任务栏右下角）：程序、对话和 llama-server 都继续跑，
+点托盘图标的“显示 / Show”恢复窗口，选“退出 / Quit”才真正结束进程并停掉它启动的
+服务器。这个行为可以在**关于 → 设置**里关掉（“关闭窗口时最小化到托盘”，默认开启），
+关掉后点 × 直接退出。同一个设置卡里还有“启动时自动加载已保存的模型”（默认关闭）：
+打开后双击启动就直接把上次的模型加载起来；命令行 `--autostart` / `--no-autostart`
+可临时覆盖这一次。
+
+重复双击不会起第二个实例：检测到本机已有 launcher 时直接唤起它的窗口；后台模式没有
+窗口，会提示到哪个地址访问。只想跑后台服务、不开窗口，用 `sm70gui.exe --no-browser`。
+窗口版没有控制台，启动过程写在 `%TEMP%\sm70gui-launcher.log`，服务端日志在
+`%TEMP%\sm70gui-server.log`，出问题先看这两个文件。
+
+它不是一个新服务：一个本地进程同时把网页界面发到 `127.0.0.1`、代理
+llama-server 的 API（流式响应逐块转发）、并管理 llama-server 的启停。所有数据只在
+本机回环上。
+
+### 第一次用
+
+1. 先把 llama.cpp 这棵树编出来（`cmake --build build`），GUI 会自己找
+   `<repo>\build\bin\llama-server.exe`；放到别处就用
+   `sm70gui.exe --server-exe <路径>` 指一下。界面端口用 `--gui-port` 改，
+   配置放哪用 `--config` 改（默认在 llama-server 旁边）；
+2. 左起 **Launch** 页：`浏览…` 选模型目录（目录一变会自动重扫）再选模型文件；
+   本地 `.gguf` 走 `-m`，填 `user/repo[:quant]` 则走 `-hf`；有视觉塔填
+   `视觉投影文件（mmproj）`，独立草稿模型填 `投机解码文件`，`模型名称` 对应
+   `--alias`；
+3. **设备**：只列出 CUDA 驱动报告的卡，**只有计算能力 7.0（SM70）的卡能开**；
+   `CUDA_VISIBLE_DEVICES` 由这些开关按 CUDA 序号拼出（与 nvidia-smi 顺序不同），
+   非 SM70 卡不给开关；
+4. **服务器参数**填常规参数（`-c/-np/-b/-ub/-t/-tb/-ngl/-sm/-fa/-ctk/-ctv/
+   --port/--cache-ram/--spec-type/--spec-draft-n-max/--temp/--top-p/--top-k/
+   --min-p/-n`），字段没覆盖的写进“额外参数”；
+5. **环境变量**：常用 9 个直接列出，其余收在“高级”里，每条带默认值和双语说明；
+   表里开的开关就是真正会导出的变量，下方命令行预览只显示与默认值不同的项；
+6. 想重载或换参数点 **Start**（保存过模型的话，双击启动时已经自动加载）；
+   启动过程与服务日志在同一页；`Stop` 只停本进程启动的服务器。
+
+改动**即改即存**（停止输入 500 ms 后写盘），状态栏显示保存时间与文件路径；
+`全部恢复默认` 会删掉配置文件回到内置默认值。**配置文件**卡片可以把当前表单存成
+命名配置、读回、重命名、删除，或导出/导入成任意路径的 JSON。界面语言跟随系统，
+可在 About 里强制 English / 简体中文；主题跟随 `data-theme`（浅色/深色）。
+
+各页签：`对话` 支持流式输出、思考计时、首字延迟、文本附件与采样抽屉；`监控` 每秒
+读一次 llama-server 的 `/metrics`、`/slots` 和本机 CPU/内存/磁盘；`关于` 显示运行中
+模型、本机配置以及表单将要启动的模型/别名；`启动` 就是上面那张表单。
+
+（维护者：改完 `tools/sm70gui/` 或 `tools/webui/` 后运行 `build_exe.bat`，它会
+重新打包并刷新仓库里的 `tools/sm70gui/sm70gui.exe`；该文件随仓库提交，别人 clone
+下来即可直接用。）
 
 ## 仓库结构
 

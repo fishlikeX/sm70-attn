@@ -174,6 +174,17 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         }
     }
 
+    // sm70-attn: with a unified KV cache and more than one slot, one ubatch can hold
+    // tokens of several sequences (and then the mask row of a query is not a contiguous
+    // visible prefix). The D256 kernels implement a single-sequence causal mask, so the
+    // CUDA backend is told once, here - it is a process-wide property, and probing the
+    // mask per node would need a device-to-host sync per attention node.
+    if (!is_router_server && params.kv_unified && params.n_parallel > 1) {
+        common_set_env("LLAMA_SM70_D256_MULTI_SEQ", "1");
+        SRV_WRN("%s%c", "unified KV with >1 slots: the SM70 D256 attention kernels "
+                        "are disabled (they assume one sequence per batch)", 10);
+    }
+
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
     // or with -c 0 for max context
     const bool ctx_pool_auto_sized = params.kv_unified_per_slot > 0 &&

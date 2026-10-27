@@ -1,8 +1,10 @@
+import os
 #!/usr/bin/env python3
 import csv, re
 from collections import defaultdict
 
-CSV_PATH = "/home/fishlikexie/ncu176k_attn.csv"
+CSV_PATH = os.environ.get("SM70_ATTN_CSV", "ncu176k_attn.csv")
+# dump one with: ncu --csv --metrics ... > ncu176k_attn.csv, or set SM70_ATTN_CSV
 rows = []
 with open(CSV_PATH, newline="") as f:
     lines = [ln for ln in f if ln.startswith('"')]

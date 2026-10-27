@@ -22,13 +22,15 @@
   <span class="st-header__brand">sm70-attn</span>
   <nav class="st-tabs" role="tablist" aria-label="Views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span data-i18n="tab.chat">Chat</span></button>
     <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Images</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-launch" aria-controls="view-launch" aria-selected="false" data-tab="launch">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-bolt"/></svg><span data-i18n="tab.launch">Launch</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span data-i18n="tab.about">About</span></button>
   </nav>
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
@@ -44,7 +46,7 @@
       <div class="chat" id="chat">
         <div class="chat-empty" id="chat-empty">
           <div class="chat-empty__title">Ask anything</div>
-          <div class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.</div>
+          <div class="chat-empty__sub" id="chat-empty-sub">Runs locally. Nothing leaves this PC.</div>
         </div>
       </div>
     </div>
@@ -135,7 +137,7 @@
             </svg>
             <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
           </div>
-          <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
+          <div class="bar-row"><span>Request slots</span><span class="muted" id="slots-text">&ndash;</span></div>
           <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
           <div class="bar-row"><span>KV cache</span><span class="muted" id="kv-text">&ndash;</span></div>
           <div class="bar-row"><span>Speculation</span><span class="muted" id="spec-text">&ndash;</span></div>
@@ -160,7 +162,7 @@
               <th class="num" title="Prompt reading speed over the tokens this request actually read, the cached prefix excluded">Prefill</th>
               <th class="num">Output</th>
               <th class="num" title="Answer writing speed, from the engine's own clock">Decode</th>
-              <th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM (experts copied over PCIe are not counted; their share is shown after it)">Hit rate</th>
+              <th class="num" title="Prompt tokens reused from the KV cache">Reused</th>
               <th class="num">Duration</th></tr></thead>
             <tbody id="req-body"><tr><td colspan="10" class="muted">No requests yet</td></tr></tbody>
           </table>
@@ -203,36 +205,165 @@
   <section class="view view--about" id="view-about" role="tabpanel" aria-labelledby="tab-btn-about" hidden>
     <div class="about">
       <div class="st-card">
-        <span class="card-title">Model and engine</span>
+        <span class="card-title" data-i18n="about.model">Model and engine</span>
         <dl class="facts" id="facts-engine"></dl>
       </div>
       <div class="st-card">
-        <span class="card-title">This PC</span>
+        <span class="card-title" data-i18n="about.pc">This PC</span>
         <dl class="facts" id="facts-hw"></dl>
       </div>
       <div class="st-card">
-        <span class="card-title">Connect your tools</span>
+        <span class="card-title" data-i18n="about.tools">Connect your tools</span>
         <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
         <dl class="facts" id="facts-api"></dl>
       </div>
       <div class="st-card">
-        <span class="card-title">Settings</span>
+        <span class="card-title" data-i18n="about.settings">Settings</span>
         <div class="st-field">
           <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
           <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
         </div>
         <div class="toggle-row"><span>Dark theme</span>
           <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
-        <p class="muted small">Chats, settings and the key are kept in this browser only.
-          <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata on GitHub</a></p>
+        <div class="st-field">
+          <label class="st-label" for="lang-select" data-i18n="lang.label">Language</label>
+          <select class="st-input" id="lang-select">
+            <option value="system" data-i18n="lang.system">Follow system</option>
+            <option value="en" data-i18n="lang.en">English</option>
+            <option value="zh" data-i18n="lang.zh">简体中文</option>
+          </select>
+        </div>
+        <div class="toggle-row"><span id="autostart-label" data-i18n="about.autostart">Load the saved model when the launcher starts</span>
+          <button class="st-toggle" id="autostart-toggle" role="switch" aria-checked="false" aria-labelledby="autostart-label"></button></div>
+        <p class="muted small" data-i18n="about.autostartNote">Off by default. Stored in the launcher config; the next sm70gui start loads the model the form last saved.</p>
+        <div class="toggle-row"><span id="minimize-label" data-i18n="about.minimizeTray">Closing the window keeps the launcher in the tray</span>
+          <button class="st-toggle" id="minimize-toggle" role="switch" aria-checked="true" aria-labelledby="minimize-label"></button></div>
+        <p class="muted small" data-i18n="about.minimizeTrayNote">On by default. The X button only hides the window; Quit from the tray icon ends the process. Turn this off to make X quit.</p>
+        <p class="muted small" data-i18n="about.settingsNote">Chats, settings and the key are kept in this browser only.
+          <a href="https://github.com/fishlikeX/sm70-attn" target="_blank" rel="noopener noreferrer">sm70-attn on GitHub</a></p>
       </div>
       <div class="st-card cfg-card" id="cfg-card" hidden>
         <div class="req-head"><span class="card-title">Model settings</span><span class="muted small" id="cfg-file"></span></div>
-        <p class="muted small">Kept in the model's run config for every client. An empty field is the default. They
-          take effect the next time the model starts (close Strata's window and start it again).</p>
+        <p class="muted small">Startup parameters are owned by the sm70gui launcher; they take effect the next
+          time the model starts.</p>
         <form class="cfg-form" id="cfg-form"></form>
         <div class="cfg-actions"><button class="st-btn st-btn--primary" id="cfg-save" type="button">Save</button>
           <span class="muted small" id="cfg-msg" role="status"></span></div>
+      </div>
+    </div>
+  </section>
+  <!-- ============================ Launch ============================ -->
+  <section class="view view--launch" id="view-launch" role="tabpanel" aria-labelledby="tab-btn-launch" hidden>
+    <div class="about">
+      <div class="st-card">
+        <div class="req-head"><span class="card-title" data-i18n="launch.model">Model</span>
+          <span class="muted small" id="launch-model-msg" role="status"></span>
+          <span class="st-badge" id="launch-state">stopped</span></div>
+        <div class="st-field">
+          <label class="st-label" for="launch-dir" data-i18n="launch.folder">Model folder</label>
+          <div class="launch-dir">
+            <input class="st-input" id="launch-dir" spellcheck="false" autocomplete="off" placeholder="folder with .gguf files">
+            <button class="st-btn st-btn--secondary" id="launch-browse" type="button" data-i18n="launch.browse">Browse…</button>
+          </div>
+        </div>
+        <div class="st-field">
+          <label class="st-label" for="launch-model" data-i18n="launch.modelField">Model file or HF repo</label>
+          <div class="launch-dir">
+            <input class="st-input" id="launch-model" list="launch-model-list" spellcheck="false"
+                   autocomplete="off" data-i18n-ph="launch.modelPh">
+            <button class="st-btn st-btn--secondary" id="launch-browse-model" type="button" data-i18n="launch.browse">Browse…</button>
+          </div>
+          <datalist id="launch-model-list"></datalist>
+        </div>
+        <div id="launch-model-extra"></div>
+        <div class="launch-facts muted small" id="launch-model-facts"></div>
+      </div>
+
+      <div class="st-card">
+        <div class="req-head"><span class="card-title" data-i18n="launch.profiles">Config files</span>
+          <span class="muted small" id="launch-prof-dir"></span></div>
+        <p class="muted small" data-i18n="launch.profilesNote">Save the form under a name, load it later, or keep a copy anywhere as JSON.</p>
+        <div class="st-field">
+          <label class="st-label" for="launch-prof-name" data-i18n="launch.profileName">Name</label>
+          <div class="launch-dir">
+            <input class="st-input" id="launch-prof-name" spellcheck="false" autocomplete="off"
+                   placeholder="e.g. 229k-tp2" data-i18n-ph="launch.profileNamePh">
+            <button class="st-btn st-btn--secondary" id="launch-prof-save" type="button" data-i18n="launch.profSave">Save</button>
+            <button class="st-btn st-btn--secondary" id="launch-prof-rename" type="button" data-i18n="launch.profRename">Rename</button>
+            <button class="st-btn st-btn--secondary" id="launch-prof-delete" type="button" data-i18n="launch.profDelete">Delete</button>
+          </div>
+        </div>
+        <div class="launch-grid" id="launch-profiles"></div>
+        <div class="launch-actions">
+          <button class="st-btn st-btn--secondary" id="launch-prof-export" type="button" data-i18n="launch.profExport">Export…</button>
+          <button class="st-btn st-btn--secondary" id="launch-prof-import" type="button" data-i18n="launch.profImport">Import…</button>
+          <span class="muted small" id="launch-prof-msg" role="status"></span>
+        </div>
+      </div>
+
+      <div class="st-card">
+        <div class="req-head"><span class="card-title" data-i18n="launch.devices">Devices</span>
+          <span class="muted small" id="launch-cuda-visible"></span></div>
+        <p class="muted small" data-i18n="launch.devicesNote">Only SM70 (compute capability 7.0) cards
+          can run these kernels; switch on the cards you want. The launcher writes the CUDA indices it
+          sees into CUDA_VISIBLE_DEVICES - not nvidia-smi's order.</p>
+        <div class="launch-devices" id="launch-devices"></div>
+      </div>
+
+      <div class="st-card">
+        <span class="card-title" data-i18n="launch.args">Server arguments</span>
+        <div class="launch-grid launch-args" id="launch-args"></div>
+      </div>
+
+      <div class="st-card">
+        <span class="card-title" data-i18n="launch.extra">Extra arguments</span>
+        <p class="muted small" data-i18n="launch.extraNote">Appended verbatim to the server command
+          line, for anything the fields above do not cover.</p>
+        <textarea class="st-input launch-extra" id="launch-extra" rows="3" spellcheck="false"
+                  placeholder="--key value --flag" data-i18n-ph="launch.extraPh"></textarea>
+      </div>
+
+      <div class="st-card">
+        <span class="card-title" data-i18n="launch.cmd">Command</span>
+        <pre class="st-cmd" id="launch-cmd"></pre>
+        <div id="launch-warns"></div>
+        <div class="launch-actions">
+          <button class="st-btn st-btn--primary" id="launch-start" type="button" data-i18n="launch.start">Start</button>
+          <button class="st-btn st-btn--secondary" id="launch-stop" type="button" data-i18n="launch.stop">Stop</button>
+          <button class="st-btn st-btn--secondary" id="launch-restart" type="button" data-i18n="launch.restart">Restart</button>
+          <button class="st-btn st-btn--secondary" id="launch-copy" type="button" data-i18n="launch.copy">Copy command</button>
+          <span class="muted small" id="launch-msg" role="status"></span>
+        </div>
+        <div class="launch-saverow">
+          <span class="muted small" id="launch-saved" role="status"></span>
+          <button class="st-btn st-btn--secondary st-btn--sm" id="launch-reset-all" type="button" data-i18n="launch.resetAll">Reset everything</button>
+        </div>
+      </div>
+
+      <div class="st-card">
+        <div class="req-head"><span class="card-title" data-i18n="launch.env">Environment</span>
+          <span class="muted small"><span id="launch-env-count">0</span>
+            <span data-i18n="launch.vars">variables</span></span></div>
+        <p class="muted small" data-i18n="launch.envNote">Advanced variables are folded away below. If you are not sure what a switch does, leave it alone — most of them change numerics or can hang the run.</p>
+        <div class="launch-toolbar">
+          <label class="launch-check"><input type="checkbox" id="launch-only-rec">
+            <span data-i18n="launch.onlyChanged">only non-default values</span></label>
+          <input class="st-input" id="launch-filter" placeholder="filter name or description" spellcheck="false" data-i18n-ph="launch.filterPh">
+          <button class="st-btn st-btn--secondary" id="launch-env-reset" type="button" data-i18n="launch.reset">Reset env to defaults</button>
+        </div>
+        <div id="launch-env"></div>
+        <details class="launch-adv" id="launch-adv">
+          <summary><span data-i18n="launch.advanced">Advanced environment variables</span>
+            <span class="muted small" id="launch-adv-count"></span></summary>
+          <p class="muted small" data-i18n="launch.advancedNote">Only touch these if you know what you are adjusting; most are not needed to run the server.</p>
+          <div id="launch-env-adv"></div>
+        </details>
+      </div>
+
+      <div class="st-card">
+        <div class="req-head"><span class="card-title" data-i18n="launch.log">Server log</span>
+          <button class="st-btn st-btn--secondary" id="launch-log-refresh" type="button" data-i18n="launch.refresh">Refresh</button></div>
+        <pre class="st-log" id="launch-log"></pre>
       </div>
     </div>
   </section>
@@ -248,7 +379,7 @@
       <label class="st-label" for="s-thinking">Thinking <output id="o-thinking"></output></label>
       <div class="seg" id="s-thinking" role="radiogroup" aria-label="Thinking">
         <button type="button" role="radio" data-v="none">Off</button><button type="button" role="radio" data-v="low">Low</button>
-        <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">High</button>
+        <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="xhigh">High</button>
       </div>
     </div>
     <div class="st-field">
@@ -292,6 +423,8 @@
 <div class="scrim" id="scrim" hidden></div>
 <div class="st-toasts" id="toasts" aria-live="polite"></div>
 <script src="web/sm70-adapter.js"></script>
+<script src="web/i18n.js"></script>
+<script src="web/launch.js"></script>
 <script src="web/app.js"></script>
 </body>
 </html>

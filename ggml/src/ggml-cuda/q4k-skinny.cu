@@ -1296,7 +1296,7 @@ static void q4k_skinny_multi_mul_mat_launch(ggml_type type, const q4k_skinny_mul
         case GGML_TYPE_Q4_K: q4k_skinny_multi_mul_mat_launch_t<GGML_TYPE_Q4_K>(p, stream); break;
         case GGML_TYPE_Q5_K: q4k_skinny_multi_mul_mat_launch_t<GGML_TYPE_Q5_K>(p, stream); break;
         case GGML_TYPE_Q6_K: q4k_skinny_multi_mul_mat_launch_t<GGML_TYPE_Q6_K>(p, stream); break;
-        default: GGML_ASSERT(!"q4k skinny: unknown type");
+        default: GGML_ABORT("q4k skinny: unknown type");
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1348,7 +1348,7 @@ static void q4k_skinny_gated_mul_mat_launch(ggml_type type, const uint8_t * gate
         case GGML_TYPE_Q4_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q4_K>(gate_codes, up_codes, input, output, n, k, m, stream); break;
         case GGML_TYPE_Q5_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q5_K>(gate_codes, up_codes, input, output, n, k, m, stream); break;
         case GGML_TYPE_Q6_K: q4k_skinny_gated_mul_mat_launch_t<GGML_TYPE_Q6_K>(gate_codes, up_codes, input, output, n, k, m, stream); break;
-        default: GGML_ASSERT(!"q4k skinny: unknown type");
+        default: GGML_ABORT("q4k skinny: unknown type");
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1543,7 +1543,7 @@ static bool q4k_skinny_mul_mat_dispatch(ggml_type type, const uint8_t * codes, c
         case GGML_TYPE_IQ3_XXS: return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_IQ3_XXS>(codes, input, output, n, k, m, stream);
         case GGML_TYPE_IQ2_XS:  return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_IQ2_XS >(codes, input, output, n, k, m, stream);
         case GGML_TYPE_IQ2_S:   return q4k_skinny_mul_mat_dispatch_t<GGML_TYPE_IQ2_S  >(codes, input, output, n, k, m, stream);
-        default: GGML_ASSERT(!"q4k skinny: unknown type"); return false;
+        default: GGML_ABORT("q4k skinny: unknown type"); return false;
     }
 }
 
@@ -1761,7 +1761,7 @@ static void q4k_skinny_repack_tiles_dispatch(ggml_type type, const void * stagin
         case GGML_TYPE_Q4_K: q4k_skinny_repack_tiles<GGML_TYPE_Q4_K>(staging, codes, meta, n, k, t0, t1, stream); break;
         case GGML_TYPE_Q5_K: q4k_skinny_repack_tiles<GGML_TYPE_Q5_K>(staging, codes, meta, n, k, t0, t1, stream); break;
         case GGML_TYPE_Q6_K: q4k_skinny_repack_tiles<GGML_TYPE_Q6_K>(staging, codes, meta, n, k, t0, t1, stream); break;
-        default: GGML_ASSERT(!"q4k skinny: unknown type");
+        default: GGML_ABORT("q4k skinny: unknown type");
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1906,7 +1906,7 @@ void ggml_cuda_q4k_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStrea
         case GGML_TYPE_Q4_K: qskinny_to_f16_kernel<GGML_TYPE_Q4_K><<<grid, 256, 0, stream>>>(dst, data, n, k); break;
         case GGML_TYPE_Q5_K: qskinny_to_f16_kernel<GGML_TYPE_Q5_K><<<grid, 256, 0, stream>>>(dst, data, n, k); break;
         case GGML_TYPE_Q6_K: qskinny_to_f16_kernel<GGML_TYPE_Q6_K><<<grid, 256, 0, stream>>>(dst, data, n, k); break;
-        default: GGML_ASSERT(!"q4k skinny to_f16: unknown type");
+        default: GGML_ABORT("q4k skinny to_f16: unknown type");
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1988,6 +1988,15 @@ bool ggml_cuda_q4k_skinny_mul_mat_codes(ggml_type type, const uint8_t * codes, c
 
 void ggml_cuda_q4k_skinny_to_f16_codes(ggml_type type, const uint8_t * codes, half * dst,
                                        int n, int k, cudaStream_t stream) {
+    // design-B decode reads this TU's LUT; initialize it before the first IQ launch
+    // (see the LUT comment in iq-skinny.cuh)
+    // the LUT is per-device memory, so the flag has to be per device too
+    static bool lut_ready[GGML_CUDA_MAX_DEVICES] = {};
+    const int lut_dev = ggml_cuda_get_device();
+    if (!lut_ready[lut_dev] && ggml_cuda_q4k_skinny_type_is_iq(type)) {
+        iq_skinny_init_lut(stream);
+        lut_ready[lut_dev] = true;
+    }
     const dim3 grid((unsigned) (k / 256), (unsigned) (n / 32), 1);
     switch (type) {
         case GGML_TYPE_Q2_K:   qskinny_to_f16_kernel<GGML_TYPE_Q2_K  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
@@ -1999,7 +2008,7 @@ void ggml_cuda_q4k_skinny_to_f16_codes(ggml_type type, const uint8_t * codes, ha
         case GGML_TYPE_IQ3_XXS: qskinny_to_f16_kernel<GGML_TYPE_IQ3_XXS><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
         case GGML_TYPE_IQ2_XS:  qskinny_to_f16_kernel<GGML_TYPE_IQ2_XS ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
         case GGML_TYPE_IQ2_S:   qskinny_to_f16_kernel<GGML_TYPE_IQ2_S  ><<<grid, 256, 0, stream>>>(dst, codes, n, k); break;
-        default: GGML_ASSERT(!"iq skinny to_f16: unknown type");
+        default: GGML_ABORT("iq skinny to_f16: unknown type");
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -2017,7 +2026,7 @@ void ggml_cuda_q4k_skinny_repack_side(ggml_type type, const void * src, uint8_t 
         case GGML_TYPE_IQ3_XXS: q4k_skinny_repack_tiles<GGML_TYPE_IQ3_XXS>(src, codes, meta, n, k, 0, n / 32, stream); break;
         case GGML_TYPE_IQ2_XS:  q4k_skinny_repack_tiles<GGML_TYPE_IQ2_XS >(src, codes, meta, n, k, 0, n / 32, stream); break;
         case GGML_TYPE_IQ2_S:   q4k_skinny_repack_tiles<GGML_TYPE_IQ2_S  >(src, codes, meta, n, k, 0, n / 32, stream); break;
-        default: GGML_ASSERT(!"iq skinny repack: unknown type");
+        default: GGML_ABORT("iq skinny repack: unknown type");
     }
     CUDA_CHECK(cudaGetLastError());
 }

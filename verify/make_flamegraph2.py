@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 # Social preview flamegraph from REAL Nsight Compute data:
 # 176k-context prefill, attention subsystem, V100.
@@ -6,7 +7,7 @@ from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
 
 CSV_PATH = "/home/fishlikexie/ncu176k_attn.csv"
-OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/flamegraph.png"
+OUT = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SM70_FLAMEGRAPH_PNG", "/tmp/flamegraph.png")
 W, H = 1280, 640
 
 rows = []

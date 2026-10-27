@@ -3,7 +3,7 @@
 # 顺序即依赖序：先单元，再整模型正确性，最后性能与默认开关决策数据。
 set -uo pipefail
 cd "$(dirname "$0")/.."
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
 echo "== [1/6] decode 内核独立测试器（13 case，q4 规范布局）=="
 bash verify/run_dec.sh || exit 1

@@ -1186,11 +1186,14 @@ void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
 
     for (ggml_tensor * t : candidates) {
         if (ggml_cuda_skinny_mode() == 2) {
-            // side buffer: original bytes survive, the decode falls back to the stock path
-            ggml_cuda_iq_skinny_repack(ctx, t);
-        } else {
-            ggml_cuda_q8_skinny_repack_inplace(ctx, t);
+            // mode 2 is the out-of-place (side buffer) route, which exists for the
+            // k-quant and IQ codecs only. There is no Q8_0 codec in that module, and
+            // handing a Q8_0 tensor to it trips its can_repack assert and aborts the
+            // process; leave Q8_0 on the stock path instead (measured: the in-place
+            // route costs 8-36% decode, so silently switching to it would be worse).
+            continue;
         }
+        ggml_cuda_q8_skinny_repack_inplace(ctx, t);
     }
 }
 

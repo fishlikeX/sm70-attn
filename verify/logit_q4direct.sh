@@ -20,7 +20,7 @@ trap cleanup EXIT
 start_server() { # $1 = tag, $2/$3 = env kv pairs appended
   local tag=$1; shift
   echo "--- server [$tag] ($*) ..."
-  env CUDA_VISIBLE_DEVICES=2 "$@" "$BIN" -m "$MODEL" --mmproj "$MMPROJ" \
+  env CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} "$@" "$BIN" -m "$MODEL" --mmproj "$MMPROJ" \
     --main-gpu 0 -c 8192 -b 4096 -ub 512 -ngl 99 -fa on -ctk q4_0 -ctv f16 \
     --spec-type draft-dflash --spec-draft-model "$DRAFT" --spec-draft-n-max 2 \
     -t 12 -tb 16 --temp 0 --top-p 1 --top-k 1 -n 256 -np 1 \

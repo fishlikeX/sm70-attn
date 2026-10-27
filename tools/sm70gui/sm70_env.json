@@ -1,0 +1,247 @@
+{
+  "groups": {
+    "d256":     { "en": "D256 flash attention",        "zh": "D256 注意力" },
+    "skinny":   { "en": "Weight repack (skinny)",      "zh": "权重重排（瘦身）" },
+    "kernel":   { "en": "Other sm_70 kernels",         "zh": "其他 sm_70 kernel" },
+    "tp2":      { "en": "Tensor parallel / allreduce", "zh": "张量并行 / allreduce" },
+    "upstream": { "en": "ggml-cuda (upstream knobs)",  "zh": "ggml-cuda（上游开关）" },
+    "debug":    { "en": "Debug and dumps",             "zh": "调试与抓取" }
+  },
+  "vars": [
+    {
+      "name": "LLAMA_SM70_D256", "default": "1", "kind": "bool",
+      "group": "d256", "tier": "common", "risk": "safe",
+      "desc": "Master switch for the D256 attention kernels. 0 = the stock path end to end (bit-identical), for A/B and troubleshooting.",
+      "desc_zh": "D256 注意力的总开关。0 = 整条走 stock 路径（逐位一致），用于 A/B 和排障。"
+    },
+    {
+      "name": "LLAMA_SM70_D256_Q4_DIRECT", "default": "0", "kind": "bool",
+      "group": "d256", "tier": "common", "risk": "careful",
+      "desc": "Read q4_0 K/V as raw blocks inside the prefill kernel: drops the f16 mirror (~470 MB/card at 229k) for ~4% slower prefill.",
+      "desc_zh": "预填充侧 q4_0 K/V 核内直读，省掉 f16 mirror（229k 约 470 MB/卡），代价约 4% 预填充。"
+    },
+    {
+      "name": "LLAMA_SM70_D256_Q8_DIRECT", "default": "0", "kind": "bool",
+      "group": "d256", "tier": "common", "risk": "careful",
+      "desc": "Same for q8_0 K/V (bit-identical to the staged mirror); ~9% slower prefill at 174k. For VRAM-tight setups.",
+      "desc_zh": "q8_0 K/V 核内直读（与 staged mirror 逐位一致），174k 预填充慢约 9%；显存吃紧时才用。"
+    },
+    {
+      "name": "LLAMA_SM70_D256_DECODE", "default": "0", "kind": "bool",
+      "group": "d256", "tier": "common", "risk": "careful",
+      "desc": "Decode through the D256 tensor-core kernel. It only pays for speculation widths w>=2; w=1 stays on the stock path.",
+      "desc_zh": "解码走 D256 张量核心 kernel。只有投机验证宽度 w≥2 才有收益；w=1 仍走 stock。"
+    },
+    {
+      "name": "LLAMA_SM70_D256_DEC_Q4", "default": "0", "kind": "bool",
+      "group": "d256", "tier": "common", "risk": "careful",
+      "desc": "q4_0 direct loads in the decode kernel (no mirror traffic per step). Independent of the prefill Q4_DIRECT switch.",
+      "desc_zh": "解码 kernel 的 q4_0 直读（省掉解码期的 mirror 读写）。与预填充的 Q4_DIRECT 各自独立。"
+    },
+    {
+      "name": "LLAMA_SM70_SKINNY", "default": "0", "kind": "enum", "choices": ["0", "1", "2"],
+      "group": "skinny", "tier": "common", "risk": "careful",
+      "desc": "k-quant repack. 0 off; 1 in-place (+10% prefill, -28% decode); 2 side-buffer copy (+9% prefill, decode unchanged, a second copy of the weights in VRAM). Also the gate for IQ_SKINNY.",
+      "desc_zh": "k-quant 瘦身。0 关；1 原地重排（+10% 预填充、解码 -28%）；2 侧缓冲副本（+9% 预填充、解码不变，多一整份权重显存）。也是 IQ_SKINNY 的前提。"
+    },
+    {
+      "name": "LLAMA_SM70_IQ_SKINNY", "default": "0", "kind": "bool",
+      "group": "skinny", "tier": "common", "risk": "careful",
+      "desc": "Repack the IQ types too: +2-3% prefill for +7.3% VRAM. Only does anything when the model has IQ3_S/IQ3_XXS/IQ2_XS/IQ2_S tensors and SKINNY != 0.",
+      "desc_zh": "IQ 类型一并重排：预填充再 +2~3%，代价 side buffer +7.3% 显存。仅当模型里存在 IQ3_S/IQ3_XXS/IQ2_XS/IQ2_S 张量、且 SKINNY≠0 时有效。"
+    },
+    {
+      "name": "LLAMA_SM70_DEQUANT_FAST", "default": "1", "kind": "bool",
+      "group": "kernel", "tier": "common", "risk": "safe",
+      "desc": "sm_70 dequant kernels for iq3_s / iq3_xxs / iq4_xs. Bit-identical to the stock kernels (there is a parity gate).",
+      "desc_zh": "sm_70 快速去量化（iq3_s / iq3_xxs / iq4_xs），与 stock 去量化逐位一致（有 parity gate）。"
+    },
+    {
+      "name": "LLAMA_SM70_GDN_CHUNK", "default": "1", "kind": "bool",
+      "group": "kernel", "tier": "common", "risk": "careful",
+      "desc": "Chunked GDN prefill path (gated_delta_net.cu). 0 disables it.",
+      "desc_zh": "GDN 分块预填充路径（gated_delta_net.cu）。0 = 关闭。"
+    },
+
+    {
+      "name": "LLAMA_SM70_SPLITKV3_MIN_KV", "default": "2048", "kind": "int",
+      "group": "d256", "tier": "advanced", "risk": "careful",
+      "desc": "SplitKV3 kicks in once kv_len reaches this value; 0 disables it. Below 2048 there is nothing to split.",
+      "desc_zh": "kv_len ≥ 该值时启用 SplitKV3 三路切分；0 关闭。低于 2048 的长 KV 用不上三路并行。"
+    },
+    {
+      "name": "LLAMA_SM70_D256_SPLITS", "default": "0", "kind": "int",
+      "group": "d256", "tier": "advanced", "risk": "careful",
+      "desc": "Cap on decode KV splits. 0 = automatic (kv_len/920, up to 48); maximum 256.",
+      "desc_zh": "解码 KV 切分上限覆盖。0 = 自动（kv_len/920，上限 48）；最大 256。"
+    },
+    {
+      "name": "LLAMA_SM70_GDN_PROLOGUE", "default": "0", "kind": "bool",
+      "group": "kernel", "tier": "advanced", "risk": "careful",
+      "desc": "GDN l2norm prologue fusion (bit-exact). Off by default: the A/B quoted in the source is slower with it on.",
+      "desc_zh": "GDN l2norm prologue 融合（逐位精确）。默认关：源码注释里的 A/B 是 ON 更慢。"
+    },
+    {
+      "name": "CUDA_VISIBLE_DEVICES", "default": "", "kind": "text", "derived": true,
+      "group": "tp2", "tier": "advanced", "risk": "careful",
+      "desc": "Built from the device switches above (SM70 cards only, CUDA index order).",
+      "desc_zh": "由上方设备开关自动拼出（只含 cc 7.0 的 SM70 卡，按 CUDA 序号）。"
+    },
+    {
+      "name": "GGML_CUDA_ALLREDUCE", "default": "auto", "kind": "text",
+      "group": "tp2", "tier": "advanced", "risk": "careful",
+      "desc": "Allreduce implementation. Unset = NCCL on Linux and the built-in one elsewhere (Windows); the fork's P2P path lives in the built-in one.",
+      "desc_zh": "多卡 allreduce 实现。未设时 Linux 用 NCCL、其他平台（Windows）用内置实现；本仓库的 P2P 路径是内置实现的一部分。"
+    },
+    {
+      "name": "GGML_CUDA_P2P_ALLGATHER", "default": "1", "kind": "bool",
+      "group": "tp2", "tier": "advanced", "risk": "careful",
+      "desc": "P2P allgather (enabled when unset or non-zero). 0 falls back to the default allgather.",
+      "desc_zh": "P2P allgather（源码按“未设或非 0 即启用”）。0 = 关闭，回落到默认 allgather。"
+    },
+    {
+      "name": "GGML_CUDA_P2P_AR_MAX_BYTES", "default": "184549376", "kind": "int",
+      "group": "tp2", "tier": "advanced", "risk": "careful",
+      "desc": "Message window for the single-shot P2P allreduce (default 176 MiB, ~704 MB of VRAM across two cards). 0 disables the path.",
+      "desc_zh": "单发 P2P allreduce 的消息窗口（默认 176 MiB，两卡约 704 MB 显存）。0 关闭该路径。"
+    },
+    {
+      "name": "GGML_CUDA_P2P_AR_NBLOCKS", "default": "80", "kind": "int",
+      "group": "tp2", "tier": "advanced", "risk": "careful",
+      "desc": "Allreduce block count (default one per SM). More than one per SM can deadlock.",
+      "desc_zh": "allreduce 的 block 数（默认每 SM 一个）。超过每 SM 一个会死锁。"
+    },
+    {
+      "name": "GGML_CUDA_P2P_AR_LL_MAX_BYTES", "default": "131072", "kind": "int",
+      "group": "tp2", "tier": "advanced", "risk": "careful",
+      "desc": "Byte ceiling for the low-latency allreduce (default 128 KiB); larger messages take the single-shot window.",
+      "desc_zh": "低延迟 allreduce 的字节上限（默认 128 KiB）；更大的消息走单发窗口路径。"
+    },
+    {
+      "name": "GGML_CUDA_P2P_AR_LL_PAYLOAD", "default": "0", "kind": "enum", "choices": ["0", "f16", "bf16"],
+      "group": "tp2", "tier": "advanced", "risk": "careful",
+      "desc": "Payload compression for the low-latency allreduce. Non-zero changes the result (rounding); 0 keeps the values.",
+      "desc_zh": "低延迟 allreduce 的载荷压缩。非 0 会改变结果（有舍入），默认 0 = 原样。"
+    },
+    {
+      "name": "GGML_CUDA_DISABLE_GRAPHS", "default": "0", "kind": "bool",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Disable CUDA graphs (troubleshooting; usually much slower).",
+      "desc_zh": "禁用 CUDA graph（排障用，通常会明显变慢）。"
+    },
+    {
+      "name": "GGML_CUDA_GRAPH_CHUNK_SIZE", "default": "0", "kind": "int",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Nodes per CUDA graph chunk; 0 captures the whole graph as one.",
+      "desc_zh": "每个 CUDA graph chunk 的节点数；0 = 整张图捕获成一个 graph。"
+    },
+    {
+      "name": "GGML_CUDA_GRAPH_OPT", "default": "0", "kind": "bool",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Graph optimization switch (only 1 enables it).",
+      "desc_zh": "graph 优化开关（仅 1 启用）。"
+    },
+    {
+      "name": "GGML_CUDA_MMQ_PREC", "default": "auto", "kind": "text",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Override the mmq src1 precision (f32/f16/auto). auto keeps what the graph asked for.",
+      "desc_zh": "覆盖 mmq 的 src1 精度（f32/f16/auto）。auto = 保留图里请求的精度。"
+    },
+    {
+      "name": "GGML_CUDA_CUBLAS_COMPUTE_TYPE", "default": "auto", "kind": "text",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "cuBLAS compute type (fp32/fp16/bf16/tf32...). auto leaves it to the backend.",
+      "desc_zh": "cuBLAS 的计算类型（fp32/fp16/bf16/tf32...）。auto 交给后端决定。"
+    },
+    {
+      "name": "GGML_CUDA_PDL", "default": "1", "kind": "bool",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Programmatic Dependent Launch (on when unset or non-zero; needs build support).",
+      "desc_zh": "Programmatic Dependent Launch（未设或非 0 启用；需要编译期支持）。"
+    },
+    {
+      "name": "GGML_CUDA_DEVICES", "default": "", "kind": "text",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Physical devices exposed to the backend (e.g. 0,1). The device switches above are usually enough.",
+      "desc_zh": "显式选择暴露给后端的物理设备（如 0,1）。一般用上方的设备开关就够了。"
+    },
+    {
+      "name": "GGML_CUDA_ENABLE_UNIFIED_MEMORY", "default": "0", "kind": "bool",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Enable unified memory (changes VRAM behaviour, usually slower).",
+      "desc_zh": "启用 unified memory（会改变显存行为，通常更慢）。"
+    },
+    {
+      "name": "GGML_CUDA_DISABLE_FUSION", "default": "0", "kind": "bool",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Disable operator fusion (troubleshooting).",
+      "desc_zh": "禁用算子融合（排障用）。"
+    },
+    {
+      "name": "GGML_CUDA_NO_PINNED", "default": "0", "kind": "bool",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Disable pinned host memory (saves system RAM; troubleshooting).",
+      "desc_zh": "禁用 pinned host 内存（省系统内存 / 排障用）。"
+    },
+    {
+      "name": "GGML_CUDA_AR_COPY_THRESHOLD", "default": "1048576", "kind": "int",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Byte threshold for the copy path in the built-in allreduce (default 1 MB).",
+      "desc_zh": "内置 allreduce 里“走拷贝路径”的字节阈值（默认 1 MB）。"
+    },
+    {
+      "name": "GGML_CUDA_AR_COPY_CHUNK_BYTES", "default": "0", "kind": "int",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Copy chunk size for the built-in allreduce; 0 = heuristic (512 KB - 2 MB).",
+      "desc_zh": "内置 allreduce 拷贝分块大小；0 = 按启发式（512 KB ~ 2 MB）。"
+    },
+    {
+      "name": "GGML_CUDA_AR_BF16_THRESHOLD", "default": "1", "kind": "int",
+      "group": "upstream", "tier": "advanced", "risk": "careful",
+      "desc": "Message size below which bf16 compression is used (default 1; 0 disables). Changes results.",
+      "desc_zh": "小消息用 bf16 压缩的阈值（默认 1；0 关闭）。会改变结果。"
+    },
+    {
+      "name": "LLAMA_SM70_D256_DEBUG", "default": "0", "kind": "bool",
+      "group": "debug", "tier": "advanced", "risk": "debug",
+      "desc": "Print the D256 kernel selection probe (ACCEPT/REJECT + reason). First decision per class by default.",
+      "desc_zh": "打印 D256 kernel 的选择探针（ACCEPT/REJECT + 原因）。默认只打每类第一次决策。"
+    },
+    {
+      "name": "LLAMA_SM70_IQ_PARITY", "default": "0", "kind": "bool",
+      "group": "debug", "tier": "advanced", "risk": "debug",
+      "desc": "At the first repack, dequantize one tensor of each type through the side buffer and through the stock kernel, then compare value by value and print nbad.",
+      "desc_zh": "首次 repack 时，把每个类型的一个张量分别用侧缓冲展开和 stock 去量化，逐值比对于 host 并打印 nbad。"
+    },
+    {
+      "name": "LLAMA_SM70_SKINNY_DEBUG_STOCK", "default": "0", "kind": "enum", "choices": ["0", "1", "2"],
+      "group": "debug", "tier": "advanced", "risk": "debug",
+      "desc": "Debug split: 1 forces IQ types onto the original path, 2 forces k-quants (0 = no intervention).",
+      "desc_zh": "调试切分：1 = IQ 类张量强制走原始路径，2 = k-quant 类走原始路径（0 = 不干预）。"
+    },
+    {
+      "name": "LLAMA_SM70_STEP_PROF", "default": "0", "kind": "bool",
+      "group": "debug", "tier": "advanced", "risk": "debug",
+      "desc": "Per-round / per-subgraph wall-clock ledger (P0, ggml-backend-meta.cpp).",
+      "desc_zh": "逐轮/子图的墙钟账本（P0，ggml-backend-meta.cpp）。"
+    },
+    {
+      "name": "SM70_DUMP", "default": "", "kind": "text",
+      "group": "debug", "tier": "advanced", "risk": "debug",
+      "desc": "Dump attention outputs to this path. Unset = zero overhead.",
+      "desc_zh": "把注意力输出抓到文件（路径）。不设即零开销。"
+    },
+    {
+      "name": "SM70_DUMP_KV", "default": "", "kind": "text",
+      "group": "debug", "tier": "advanced", "risk": "debug",
+      "desc": "Dump the D256 kernel's Q/K/V inputs to this path for offline reproduction.",
+      "desc_zh": "把 D256 kernel 的 Q/K/V 输入抓到文件（路径），供离线复现。"
+    },
+    {
+      "name": "SM70_DUMP_MAX", "default": "4096", "kind": "int",
+      "group": "debug", "tier": "advanced", "risk": "debug",
+      "desc": "How many times SM70_DUMP may fire (default 4096).",
+      "desc_zh": "SM70_DUMP 最多抓多少次（默认 4096）。"
+    }
+  ]
+}

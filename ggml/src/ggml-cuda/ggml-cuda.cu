@@ -2133,7 +2133,29 @@ static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const 
     ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
 }
 
+// debug isolation switch (temporary): force a class of repacked tensors back onto the
+// stock path, so a failure can be attributed to the IQ codecs, the k-quant codecs, or
+// the presence of the side buffers themselves
+static bool sm70_skinny_debug_stock(const ggml_tensor * t) {
+    static const int mode = [] {
+        const char * e = getenv("LLAMA_SM70_SKINNY_DEBUG_STOCK");
+        return e ? atoi(e) : 0; // 1 = IQ types stock, 2 = k-quant types stock, 3 = both
+    }();
+    if (mode == 0) {
+        return false;
+    }
+    const bool iq = t->type == GGML_TYPE_IQ3_S || t->type == GGML_TYPE_IQ3_XXS ||
+                    t->type == GGML_TYPE_IQ2_XS || t->type == GGML_TYPE_IQ2_S;
+    return (mode & 1) ? iq : (mode & 2) ? !iq : false;
+}
+
 static void ggml_cuda_mul_mat_iq_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (sm70_skinny_debug_stock(src0)) {
+        ggml_tensor src0_tmp = *src0;
+        src0_tmp.extra = nullptr;
+        ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
+        return;
+    }
     // Hybrid policy (measured 2026-10-13): the M>64 expansion path is much faster than
     // the stock mmq/DP4A path (single-V100 pp512 938.8 vs 653.8 t/s with design B) while
     // the small-M skinny kernels do not beat mmq for the IQ types (tg128 24.5-29.8 vs
