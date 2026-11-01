@@ -201,7 +201,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
                 if (t != COMMON_SPECULATIVE_TYPE_NONE) { spec_on = true; break; }
             }
             const int drafts = spec_on ? params.speculative.draft.n_max : 0;
-            const int dec_w  = params.n_parallel * (1 + drafts);
+            // Capped at 8: wider decode batches are not verified yet (see
+            // sm70_d256_dec_wmax), so they must keep falling back to stock.
+            const int dec_w  = std::min(params.n_parallel * (1 + drafts), 8);
             common_set_env("LLAMA_SM70_D256_DEC_WMAX", std::to_string(dec_w));
             SRV_INF("decode width ceiling: %d (n_parallel %d x (1 + %d drafts))\n",
                     dec_w, params.n_parallel, drafts);

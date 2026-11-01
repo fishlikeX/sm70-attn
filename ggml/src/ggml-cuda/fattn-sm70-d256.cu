@@ -401,10 +401,14 @@ static bool sm70_d256_dec_q4_direct() {
 // measured one. The default covers the launch configurations we ship (slots x
 // (1 + drafts)); llama-server raises it to exactly that product when a unified
 // pool runs several slots, and 0 means no ceiling at all.
+// Default 8: above it the mask-driven decode is NOT verified - 4 slots x 4
+// tokens (w = 16) reproduces the same burst differently on two runs with the
+// stock build bit-stable, so something in that path is wrong. The ceiling keeps
+// those nodes on stock until the cause is found. Raise it only with evidence.
 static int sm70_d256_dec_wmax() {
     static const int w = [] {
         const char * e = getenv("LLAMA_SM70_D256_DEC_WMAX");
-        return e ? atoi(e) : 16;
+        return e ? atoi(e) : 8;
     }();
     return w;
 }

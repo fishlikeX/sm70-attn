@@ -249,3 +249,11 @@ batch shape, no silent fallback - not decode throughput. What is missing is a
 depth threshold: decode should fall back to stock below some measured kv_len, and
 none of these runs says where that line is (it is above 16k and below 174k, and
 finding it costs a long-context sweep).
+
+Verified widths for the mask-driven decode: w=4 (4 slots x 1 token) and w=8
+(2 slots x 4) reproduce bit-identically across repeated runs. w=16 (4 slots x 4
+tokens, MTP-3) does not reproduce - and once the ceiling below sends those nodes
+to stock, the same instability shows up on the stock build as well, so it is a
+property of that launch shape, not of this kernel. The ceiling is 8 for that
+reason: it keeps the unverified shape out, and llama-server caps its adaptive
+value there.
