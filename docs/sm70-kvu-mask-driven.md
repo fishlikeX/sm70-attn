@@ -288,6 +288,24 @@ measurement.
 KV quantization is not the cause: the same shape with an f16 K and V cache gave
 tuned 41 / stock 41, unchanged from the q4_0 numbers.
 
+Where the flips actually happen was measured on three stock requests at their
+first divergence (top-2 margin in each run, and the logprob drift over the ids
+both runs share):
+
+| request | first flip at | margin A | margin B | drift |
+|---|---:|---:|---:|---:|
+| req 0 | token 23 | 0.237 | 0.060 | 0.160 |
+| req 2 | token 23 | 0.106 | 0.031 | 0.155 |
+| req 3 | token 26 | 0.090 | 0.032 | 0.211 |
+
+All three flipped where the drift exceeded the smaller margin, i.e. where the
+two candidates were closer than the noise between runs. That is the signature of
+a floating-point ordering effect, not of a wrong kernel. Note the magnitude: the
+drift that matters is the one measured *before* the streams separate, about
+0.2 nat. The 1.9 nat quoted elsewhere in this document was measured after
+divergence, when the two runs are answering different contexts, and says nothing
+about the mechanism.
+
 Consequence for the ceiling: it is still 8, because widths above it were never
 verified for this kernel - but it does not, by itself, make wide verify batches
 reproducible, since stock flakes on them too. Single-token multi-slot decode

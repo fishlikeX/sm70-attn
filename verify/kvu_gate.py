@@ -191,6 +191,31 @@ def ids_and_probs(resp):
     return ids, lps
 
 
+def near_tie_report(a, b, label):
+    """At the first position where two runs pick different tokens, print the
+    top-2 margin of each run and the logprob drift over shared ids.
+
+    The only thing that distinguishes "the race is decided by floating-point
+    order" from "the kernel is wrong" is whether the drift is big enough to
+    reorder the top two: a flip is explainable by drift only when
+    drift >= min(gap_A, gap_B)."""
+    ia, la = ids_and_probs(a)
+    ib, lb = ids_and_probs(b)
+    for p in range(min(len(ia), len(ib))):
+        if ia[p] == ib[p]:
+            continue
+        ma, mb = la[p], lb[p]
+        gap_a = (ma[0][1] - ma[1][1]) if len(ma) > 1 else float("inf")
+        gap_b = (mb[0][1] - mb[1][1]) if len(mb) > 1 else float("inf")
+        da, db = dict(ma), dict(mb)
+        drift = max((abs(da[k] - db[k]) for k in set(da) & set(db)), default=0.0)
+        verdict = "near-tie" if drift >= min(gap_a, gap_b) else "NOT a near-tie"
+        print(f"    {label} first flip @ {p}: A={ia[p]} B={ib[p]} "
+              f"gap_A={gap_a:.3f} gap_B={gap_b:.3f} drift={drift:.3f} -> {verdict}")
+        return
+    print(f"    {label} no flip")
+
+
 def compare(a, b, tol, flip_thr=None):
     """Return (token_mismatches, max_abs_dlogp, rank_flips, ties)."""
     if flip_thr is None:
@@ -326,6 +351,10 @@ def main():
                 m, d, f, _ = compare(runs[tag][pat][i], runs[tag][pat + "2"][i], args.tol)
                 wm, wd, wf = max(wm, m), max(wd, d), max(wf, f)
             print(f"  [{tag}/{pat}] tok_mismatch={wm} max|dlogp|={wd:.2e} rank_flips={wf}")
+            for i in range(len(texts)):
+                if compare(runs[tag][pat][i], runs[tag][pat + "2"][i], args.tol)[0] > 0:
+                    near_tie_report(runs[tag][pat][i], runs[tag][pat + "2"][i],
+                                    f"{tag}/{pat}/req{i}")
 
     # The server-level patterns are not reproducible run to run (the control
     # above measures it), so a fixed 1e-3 cannot be the bar here: the bar is the
