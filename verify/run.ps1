@@ -25,7 +25,7 @@ $md5 = {
     (Get-FileHash -Algorithm MD5 -InputStream (New-Object IO.MemoryStream(,$bytes))).Hash.ToLower()
 }
 $kmd5  = & $md5 "$root\fattn-sm70-d256-kernel.cuh"
-$expect = "3e53e7ba73f412f29d86bd873adbf88b"     # fattn-sm70-d256-kernel.cuh @ kvu-mask-driven, LF-normalized (2026-11-01) - MaskMD template param + mask_kv/row_lo/row_hi params; the non-MaskMD instantiation is untouched
+$expect = "1f9ca8027c6d4123370418b13982ad07"     # fattn-sm70-d256-kernel.cuh @ kvu-mask-driven, LF-normalized (2026-11-01) - MaskMD template param + mask_kv/row_lo/row_hi params; the non-MaskMD instantiation is untouched
 if ($kmd5 -ne $expect) { throw "kernel md5 drift: $kmd5 != $expect — rebuild the harness audit before trusting results" }
 Write-Host ("kernel md5 ok: " + $kmd5)
 

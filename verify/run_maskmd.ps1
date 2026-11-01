@@ -26,7 +26,7 @@ $md5 = {
     (Get-FileHash -Algorithm MD5 -InputStream (New-Object IO.MemoryStream(,$bytes))).Hash.ToLower()
 }
 $kmd5   = & $md5 "$root\fattn-sm70-d256-kernel.cuh"
-$expect = "3e53e7ba73f412f29d86bd873adbf88b"   # fattn-sm70-d256-kernel.cuh @ kvu-mask-driven (2026-11-01)
+$expect = "1f9ca8027c6d4123370418b13982ad07"   # fattn-sm70-d256-kernel.cuh @ kvu-mask-driven (2026-11-01)
 $mmd5   = & $md5 "$root\fattn-sm70-d256-maskmd.cuh"
 $mexp   = "2f74081394d0185aa077e38f510f68a5"   # fattn-sm70-d256-maskmd.cuh @ kvu-mask-driven (2026-11-01)
 if ($kmd5 -ne $expect) { throw "kernel md5 drift: $kmd5 != $expect - re-audit before trusting results" }

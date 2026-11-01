@@ -814,19 +814,35 @@ void sm70_d256_splitd_dense_kernel(
             // ceil((col_last + 1) / kBlockN) - 1, and the block holding col_first
             n_block_max = (col_last + kBlockN) / kBlockN - 1;
             n_block_min = col_first / kBlockN;
+        } else {
+            // No visible cell anywhere in this tile: an empty window. The loop
+            // body never runs and every row keeps its -1e30 / 0 statistics, which
+            // the merge kernel already guards.
+            n_block_max = -1;
+            n_block_min = 0;
         }
     } else {
         const int max_kv_for_tile = query_row_base + kBlockM + kv_offset;
         const int n_block_limit = max_kv_for_tile < kv_len
             ? max_kv_for_tile
             : kv_len;
-        const int visible_n_blocks = cute::ceil_div(n_block_limit, kBlockN);
         n_block_min = 0;
-        n_block_max = visible_n_blocks - 1;
-        if constexpr (SplitKV3) {
-            n_block_min = visible_n_blocks * split / 3;
-            n_block_max = visible_n_blocks * (split + 1) / 3 - 1;
-        }
+        n_block_max = cute::ceil_div(n_block_limit, kBlockN) - 1;
+    }
+    if constexpr (SplitKV3) {
+        // Disjoint contiguous thirds of the window. Their union is the window
+        // itself, so every visible cell lands in exactly one split whichever way
+        // the window was derived (causal bound or mask bounds).
+        // Under MaskMD the window is per tile and can be tiny (two contiguous
+        // sequences of a fresh pool are a handful of blocks apart), where
+        // tripling the CTA count for nothing would cost more than it saves: below
+        // 6 blocks split 0 takes the whole window and 1, 2 write neutral
+        // partials, which the merge already guards.
+        const int span = n_block_max - n_block_min + 1;
+        const int base = n_block_min;
+        const int ns = (MaskMD && span < 6) ? 1 : 3;
+        n_block_min = base + (span > 0 ? span * split / ns : 0);
+        n_block_max = base + (span > 0 ? span * (split + 1) / ns : 0) - 1;
     }
     // SplitKV3 guard: an empty split segment (n_block_max < n_block_min) must
     // still load a valid first tile to keep the gmem addresses in range; use

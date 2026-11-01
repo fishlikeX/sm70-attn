@@ -239,9 +239,12 @@ static bool sm70_maskmd(const ggml_tensor * K, const ggml_tensor * V, const ggml
     if (mask->type != GGML_TYPE_F16 || mask->ne[3] != 1) {
         return false;
     }
-    if (sm70_kv_direct(K) || sm70_kv_direct(V)) {
-        return false;
-    }
+    // q4/q8-direct composes with the mask-driven path: the raw-block loaders
+    // only change how K/V words reach the fragments, the masking site is the
+    // score fragment either way, and get_alloc_size already accounts for the
+    // mirror it saves (both sides use sm70_kv_direct).
+    GGML_UNUSED(K);
+    GGML_UNUSED(V);
     return true;
 }
 
@@ -654,14 +657,21 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
             return false;
         }
     }
+    // Report the two axes independently: the KV layout and the mask source are
+    // orthogonal now that the direct loaders compose with the mask-driven path.
+    const bool acc_q8 = (K->type == GGML_TYPE_Q8_0 && sm70_kv_direct(K))
+                     || (V->type == GGML_TYPE_Q8_0 && sm70_kv_direct(V));
+    const bool acc_direct = acc_q8 || sm70_kv_direct(K) || sm70_kv_direct(V);
     const char * accept_reason = "ACCEPT: sm70 d256 kernel selected";
-    if (sm70_maskmd(K, V, mask)) {
-        accept_reason = "ACCEPT: sm70 d256 + mask-driven (unified KV)";
-    } else if ((K->type == GGML_TYPE_Q8_0 && sm70_kv_direct(K))
-     || (V->type == GGML_TYPE_Q8_0 && sm70_kv_direct(V))) {
+    if (acc_q8) {
         accept_reason = "ACCEPT: sm70 d256 + q8-direct";
-    } else if (sm70_kv_direct(K) || sm70_kv_direct(V)) {
+    } else if (acc_direct) {
         accept_reason = "ACCEPT: sm70 d256 + q4-direct";
+    }
+    if (sm70_maskmd(K, V, mask)) {
+        accept_reason = acc_q8  ? "ACCEPT: sm70 d256 + q8-direct + mask-driven"
+                      : acc_direct ? "ACCEPT: sm70 d256 + q4-direct + mask-driven"
+                                   : "ACCEPT: sm70 d256 + mask-driven (unified KV)";
     }
     sm70_d256_probe(accept_reason, cc, Q, K, V, mask);
     return true;
@@ -890,43 +900,32 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     // in-kernel dequant, 2 = q8_0 in-kernel dequant. Template order
     // <El, PagedKV, ElOut, SplitKV3, Kq4, Vq4, Kq8, Vq8> -> flags for mode
     // (i,j) are Kq4=(i==1), Vq4=(j==1), Kq8=(i==2), Vq8=(j==2).
-    // 18 instantiations: {dense, SplitKV3} x {0,1,2}^2.
-    auto kernel_00 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, false, false>;
-    auto kernel_01 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, true,  false, false>;
-    auto kernel_02 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, false, true >;
-    auto kernel_10 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  false, false, false>;
-    auto kernel_11 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  true,  false, false>;
-    auto kernel_12 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  false, false, true >;
-    auto kernel_20 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, true,  false>;
-    auto kernel_21 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, true,  true,  false>;
-    auto kernel_22 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, true,  true >;
-    // SplitKV3 (upstream sm70_flash_attn_d256_splitkv3 patch, 8/23 port):
-    // 3-way KV split for long-prefix prefill — triples the CTA count so late
-    // chunks of a long prefill stop serializing their KV sweep on a saturated
-    // SM grid. Env-tunable threshold (default 2048; 0 disables).
-    auto kernel_s3_00 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false, false, false>;
-    auto kernel_s3_01 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, true,  false, false>;
-    auto kernel_s3_02 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false, false, true >;
-    auto kernel_s3_10 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  false, false, false>;
-    auto kernel_s3_11 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  true,  false, false>;
-    auto kernel_s3_12 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  false, false, true >;
-    auto kernel_s3_20 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false, true,  false>;
-    auto kernel_s3_21 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, true,  true,  false>;
-    auto kernel_s3_22 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false, true,  true >;
-    // Mask-driven prefill for a unified KV pool (server hint): dense only,
-    // SplitKV3 off, staged f16 KV layout only — exactly one extra instantiation.
-    auto kernel_md    = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, false, false, true>;
-    using kernel_fn_t = decltype(kernel_00);
-    const kernel_fn_t kfn_dense[3][3] = {
-        {kernel_00, kernel_01, kernel_02},
-        {kernel_10, kernel_11, kernel_12},
-        {kernel_20, kernel_21, kernel_22},
+    // 36 instantiations: {dense, SplitKV3} x {position mask, mask tensor} x
+    // {0,1,2}^2. The MaskMD axis exists because a unified pool combines with any
+    // KV layout; its template default keeps the pre-existing 18 byte-identical.
+#define SM70_D256_K(S3, MM, I, J)                   \
+    FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel< \
+        El, false, float, S3, (I) == 1, (J) == 1, (I) == 2, (J) == 2, MM>
+    using kernel_fn_t = decltype(&SM70_D256_K(false, false, 0, 0));
+    const kernel_fn_t kfn_tbl[4][9] = {
+        // position mask, dense
+        { SM70_D256_K(false, false, 0, 0), SM70_D256_K(false, false, 0, 1), SM70_D256_K(false, false, 0, 2),
+          SM70_D256_K(false, false, 1, 0), SM70_D256_K(false, false, 1, 1), SM70_D256_K(false, false, 1, 2),
+          SM70_D256_K(false, false, 2, 0), SM70_D256_K(false, false, 2, 1), SM70_D256_K(false, false, 2, 2) },
+        // position mask, SplitKV3
+        { SM70_D256_K(true,  false, 0, 0), SM70_D256_K(true,  false, 0, 1), SM70_D256_K(true,  false, 0, 2),
+          SM70_D256_K(true,  false, 1, 0), SM70_D256_K(true,  false, 1, 1), SM70_D256_K(true,  false, 1, 2),
+          SM70_D256_K(true,  false, 2, 0), SM70_D256_K(true,  false, 2, 1), SM70_D256_K(true,  false, 2, 2) },
+        // mask tensor, dense
+        { SM70_D256_K(false, true,  0, 0), SM70_D256_K(false, true,  0, 1), SM70_D256_K(false, true,  0, 2),
+          SM70_D256_K(false, true,  1, 0), SM70_D256_K(false, true,  1, 1), SM70_D256_K(false, true,  1, 2),
+          SM70_D256_K(false, true,  2, 0), SM70_D256_K(false, true,  2, 1), SM70_D256_K(false, true,  2, 2) },
+        // mask tensor, SplitKV3
+        { SM70_D256_K(true,  true,  0, 0), SM70_D256_K(true,  true,  0, 1), SM70_D256_K(true,  true,  0, 2),
+          SM70_D256_K(true,  true,  1, 0), SM70_D256_K(true,  true,  1, 1), SM70_D256_K(true,  true,  1, 2),
+          SM70_D256_K(true,  true,  2, 0), SM70_D256_K(true,  true,  2, 1), SM70_D256_K(true,  true,  2, 2) },
     };
-    const kernel_fn_t kfn_s3[3][3] = {
-        {kernel_s3_00, kernel_s3_01, kernel_s3_02},
-        {kernel_s3_10, kernel_s3_11, kernel_s3_12},
-        {kernel_s3_20, kernel_s3_21, kernel_s3_22},
-    };
+#undef SM70_D256_K
     // Mode per tensor: raw-block direct only; a q4/q8 tensor with its direct
     // env off falls back to the staged f16 mirror (mode 0).
     const int k_mode = k_direct ? (K->type == GGML_TYPE_Q4_0 ? 1 : 2) : 0;
@@ -937,16 +936,12 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     static bool smem_raised[GGML_CUDA_MAX_DEVICES] = {};
     const int smem_dev = ggml_cuda_get_device();
     if (!smem_raised[smem_dev]) {
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                CUDA_CHECK(cudaFuncSetAttribute((const void *) kfn_dense[i][j],
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
-                CUDA_CHECK(cudaFuncSetAttribute((const void *) kfn_s3[i][j],
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 9; ++j) {
+                CUDA_CHECK(cudaFuncSetAttribute((const void *) kfn_tbl[i][j],
                     cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
             }
         }
-        CUDA_CHECK(cudaFuncSetAttribute((const void *) kernel_md,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
         smem_raised[smem_dev] = true;
     }
 
@@ -954,9 +949,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         const char * e = getenv("LLAMA_SM70_SPLITKV3_MIN_KV");
         return e ? atoi(e) : 2048;
     }();
-    // Mask-driven mode splits nothing: its three segments would have to follow
-    // the mask's visible runs, not an equal division of the causal window.
-    const bool use_splitkv3 = !mask_md && nb == 1 && splitkv3_min_kv > 0
+    // SplitKV3 also runs under MaskMD: the kernel divides whatever window the
+    // tile got (causal bound or mask bounds) into thirds along the visible
+    // range, so the two are orthogonal.
+    const bool use_splitkv3 = nb == 1 && splitkv3_min_kv > 0
         && kv_len >= splitkv3_min_kv && kv_len > q_len;
 
     const dim3 block(Traits::kNThreads);
@@ -984,7 +980,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 row_lo, row_hi);
         CUDA_CHECK(cudaGetLastError());
 
-        kernel_md<<<grid, block, Traits::kSmemBytes, stream>>>(
+        // SplitKV3 composes with MaskMD (the kernel thirds whatever window the
+        // tile got), so the window axis and the split axis are independent.
+        const kernel_fn_t kfn_md = kfn_tbl[2 + (use_splitkv3 ? 1 : 0)][k_mode * 3 + v_mode];
+        kfn_md<<<grid, block, Traits::kSmemBytes, stream>>>(
                 (const El *) Qs,
                 (const El *) K_h2,
                 (const El *) V_h2,
@@ -1011,9 +1010,11 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 row_hi,
                 softmax_scale_log2,
                 nullptr, 0, 0,
-                nullptr, nullptr, nullptr);
+                use_splitkv3 ? partial_out : nullptr,
+                use_splitkv3 ? partial_max : nullptr,
+                use_splitkv3 ? partial_sum : nullptr);
     } else if (use_splitkv3) {
-        const auto kfn = kfn_s3[k_mode][v_mode];
+        const auto kfn = kfn_tbl[1][k_mode * 3 + v_mode];
         kfn<<<grid, block, Traits::kSmemBytes, stream>>>(
                 (const El *) Qs,
                 (const El *) K_h2,
@@ -1039,7 +1040,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 nullptr, 0, 0,
                 partial_out, partial_max, partial_sum);
     } else {
-        const auto kfn = kfn_dense[k_mode][v_mode];
+        const auto kfn = kfn_tbl[0][k_mode * 3 + v_mode];
         kfn<<<grid, block, Traits::kSmemBytes, stream>>>(
                 (const El *) Qs,
                 (const El *) K_h2,

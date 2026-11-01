@@ -123,6 +123,7 @@ struct Case {
     int per_seq;
     PoolLayout layout;
     bool empty_row;
+    bool split3 = false;   // SplitKV3 on top of the mask window
 };
 
 static int run_case(const Case & tc, bool verbose) {
@@ -211,10 +212,25 @@ static int run_case(const Case & tc, bool verbose) {
     }
 
     // ---- 2. attention -----------------------------------------------------
-    auto kfn = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<
-        El, false, float, false, false, false, false, false, true>;
+    const int64_t rows3 = (int64_t) q_pad * HQ;
+    float * dP_out = nullptr;
+    float * dP_max = nullptr;
+    float * dP_sum = nullptr;
+    if (tc.split3) {
+        // SplitKV3: three partial (numerator, max, sum) triples per row, merged
+        // back into dO by the merge kernel - the same path the launcher takes
+        // when kv_len >= LLAMA_SM70_SPLITKV3_MIN_KV.
+        CK(cudaMalloc(&dP_out, (size_t) 3 * rows3 * D * sizeof(float)));
+        CK(cudaMalloc(&dP_max, (size_t) 3 * rows3 * sizeof(float)));
+        CK(cudaMalloc(&dP_sum, (size_t) 3 * rows3 * sizeof(float)));
+    }
+    auto kfn = tc.split3
+        ? FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<
+              El, false, float, true, false, false, false, false, true>
+        : FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<
+              El, false, float, false, false, false, false, false, true>;
     CK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
-    const dim3 grid(q_pad / Traits::kBlockM, 1, HQ);
+    const dim3 grid(q_pad / Traits::kBlockM, tc.split3 ? 3 : 1, HQ);
     const dim3 block(Traits::kNThreads);
     kfn<<<grid, block, Traits::kSmemBytes, 0>>>(
             (const El *) dQ, (const El *) dK, (const El *) dV, dO,
@@ -234,8 +250,15 @@ static int run_case(const Case & tc, bool verbose) {
             dLo, dHi,
             scale_log2,
             nullptr, 0, 0,
-            nullptr, nullptr, nullptr);
+            dP_out, dP_max, dP_sum);
     CK(cudaGetLastError());
+    if (tc.split3) {
+        FLASH_NAMESPACE::sm70_d256_splitkv3_merge_kernel
+            <<<dim3((unsigned) rows3), Traits::kHeadDim, 0, 0>>>(
+                (const float *) dP_out, (const float *) dP_max,
+                (const float *) dP_sum, dO, rows3, scale_log2);
+        CK(cudaGetLastError());
+    }
     CK(cudaDeviceSynchronize());
 
     std::vector<float> Oh((size_t) q_pad * HQ * D);
@@ -325,6 +348,7 @@ static int run_case(const Case & tc, bool verbose) {
 
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dM); cudaFree(dO);
     cudaFree(dLo); cudaFree(dHi);
+    if (dP_out) { cudaFree(dP_out); cudaFree(dP_max); cudaFree(dP_sum); }
     (void) verbose;
     return (bad || nan_out || bounds_bad) ? 1 : 0;
 }
@@ -346,6 +370,10 @@ int main(int argc, char ** argv) {
         { "md-tail-100",     2,  73, LAYOUT_CONTIG,        false },
         // one row with no visible cell at all
         { "md-empty-row",    2,  96, LAYOUT_CONTIG,        true  },
+        // SplitKV3 composes with the mask window: three partial segments over
+        // whatever range the mask left visible, merged back.
+        { "md-split3-600",   1, 600, LAYOUT_SINGLE_CAUSAL, false, true },
+        { "md-split3-seq4",  4, 160, LAYOUT_INTERLEAVE8,   false, true },
     };
 
     int fails = 0;
