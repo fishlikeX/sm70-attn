@@ -67,7 +67,7 @@ class Server:
             BIN, "-m", args.model, "-ngl", "99", "-fit", "off",
             "-c", str(args.ctx), "-b", str(args.batch), "-ub", str(args.ubatch),
             "-fa", "on", "-ctk", args.ctk, "-ctv", args.ctv,
-            "-t", "12", "-tb", "16", "--temp", "0",
+            "-t", str(args.threads), "-tb", str(args.threads_batch), "--temp", "0",
             "-np", str(args.np), "-kvu", "--seed", "42",
             "--host", "127.0.0.1", "--port", str(self.port),
         ]
@@ -244,6 +244,8 @@ def main():
     ap.add_argument("--n-probs", type=int, default=5)
     ap.add_argument("--tol", type=float, default=1e-3)
     ap.add_argument("--decode", action="store_true", help="enable the D256 decode kernel env")
+    ap.add_argument("--threads", type=int, default=12)
+    ap.add_argument("--threads-batch", type=int, default=16)
     ap.add_argument("--mtp", type=int, default=0,
                     help="speculative draft-mtp with this n-max (0 = off)")
     ap.add_argument("--debug", action="store_true")
