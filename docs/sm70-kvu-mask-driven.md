@@ -1,6 +1,11 @@
 # Mask-driven D256 prefill for a unified KV pool
 
-Status: shipped on `kvu-mask-driven` (2026-11-01). Prefill only; decode stays on
+Status: shipped on `kvu-mask-driven` (2026-11-01). Prefill and decode both take
+the mask-driven path; SplitKV3 and q4/q8-direct compose with it. The original
+phase-1 scope (prefill only) is described first, the phase-2 additions follow in
+section 7.
+
+<!-- phase-1 scope line kept for history: decode stays on the stock path. -->
 the stock path. Gates: kernel harness 6/6, existing kernel harness 28/28, e2e
 single card and TP2 both PASS.
 
@@ -68,10 +73,10 @@ runs instead.
 but only when the user has not set the variable, so `=0` stays a working
 escape hatch to the stock path.
 
-Decode is untouched on purpose: `ok_d` now rejects when the hint is set. Its
-kernel carries one `kv_offset` for all rows, and under `-np N` without
-speculation `q_len` is exactly N tokens from N different sequences, so it would
-compute wrong values, not just be slow.
+Decode was left on stock in phase 1 on purpose: that kernel carries one
+`kv_offset` for all rows, and under `-np N` without speculation `q_len` is
+exactly N tokens from N different sequences, so it would have computed wrong
+values, not just been slow. Phase 2 fixes that - see section 7.
 
 ## 3. Cost model
 
@@ -174,15 +179,57 @@ per layer.
 
 ## 6. Not done (v2 candidates)
 
-- **Decode under a unified pool.** `fattn-sm70-d256-decode.cuh` needs the same
-  treatment (per-token mask instead of one `kv_offset`). Worth doing only if the
-  measurement says the TC decode kernel still pays under `-kvu`; with MTP on it
-  is already rejected by the 2..8 verify-width window.
 - **Mask traffic.** Precompute a 2-bit state per (row, 32-column block)
   (all hidden / mixed / all visible) once per node: ~0.5 MB at 8k x 8k, resident
   in L2, and blocks that are all visible skip the f16 read entirely. Drops the
   mask cost by two orders of magnitude. Not needed while 12.5% is affordable.
-- **SplitKV3 on the mask-driven path**: split along the visible runs instead of
-  an equal division.
-- **q4/q8-direct on the mask-driven path**: the raw-block loaders would have to
-  carry the same parameters; the staged f16 layout is the default anyway.
+
+## 7. Phase 2: decode, SplitKV3, q4/q8-direct
+
+**SplitKV3** now composes with the mask window. The kernel used to split the
+causal window into equal thirds, which a window that starts at the first visible
+cell cannot use; it now divides *whatever* window the tile got (base + span/3).
+For the causal path that is identical by construction (base 0, span =
+visible_n_blocks). Under MaskMD a window shorter than 6 blocks is not split at
+all - two runs of a fresh pool are a handful of blocks apart, and tripling the
+CTA count there costs more than the merge; splits 1 and 2 then write neutral
+partials, which the merge already guards. Harness: two new cases (one sequence,
+and four slots interleaved in runs of 8), 8/8 pass at 1-3e-5, and the 28-case
+battery still reports exactly the same error values, i.e. the causal path did
+not move.
+
+**q4/q8-direct** now composes too: the raw-block loaders only change how K/V
+words reach the fragments, the masking site is the score fragment either way, and
+`get_alloc_size` derives the f16 mirror from the same `sm70_kv_direct` predicate
+on both sides. The instantiation table became {dense, SplitKV3} x {position mask,
+mask tensor} x {f16, q4, q8}^2 = 36. The routing probe reports the two axes
+independently, so a ledger can tell "+ q4-direct + mask-driven" from the staged
+one.
+
+**Decode** takes a `MaskMD` template parameter: the per-key predicate reads the
+mask row of the token instead of comparing against one `kv_offset`, and the live
+probe degrades to the capacity because no single boundary exists any more. Cost:
+one 2-byte mask read per (row, key) against 512 B of K+V.
+
+The width ceiling is the part that had to become adaptive. Under `-kvu` the
+decode ubatch is `slots x (1 + drafts)` tokens wide (4 slots with MTP-3 is 16),
+so a hardcoded `<= 8` would silently send every speculative decode back to
+stock. The kernel loops its 32-row passes for any width, so the hard limit is
+gone; `LLAMA_SM70_D256_DEC_WMAX` is a measured-performance ceiling (default 16,
+0 = none), and llama-server raises it to exactly `n_parallel x (1 + n_max)` for
+the launch configuration when a unified pool runs several slots - a value the
+user set wins.
+
+Measured, 4 slots on one V100 (one token per slot without speculation, 4 tokens
+with MTP-3):
+
+| workload | stock | mask-driven + TC decode |
+|---|---:|---:|
+| decode at ~0.9k context, w=4 | 19.9 tok/s | 18.4 tok/s (**-7%**) |
+| decode at ~16k context, w=4 | 1.5 / 0.9 / 13.7 / 3.1 tok/s | 2.4 / 1.4 / 16.0 / 5.2 tok/s |
+| prefill 4 x 16k | 646 tok/s | 902 tok/s (+40%) |
+
+So the TC decode kernel is the wrong tool at short context (the weight stream
+dominates and the KV split only adds overhead) and the right one at depth - the
+same crossover the single-sequence path has, just shifted by the wider ubatch.
+The ceiling exists to keep that from being decided by an arbitrary 8.
