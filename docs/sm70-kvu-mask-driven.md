@@ -94,13 +94,15 @@ The scan window is the union of the tile's visible cells, not the pool: with the
 steady state (each slot's cells in runs of one ubatch chunk) a 64-row tile sits
 inside one run.
 
-Measured, 4 slots on one V100:
+Measured, 4 slots (prefill, aggregate of the four requests):
 
 | workload | stock (`LLAMA_SM70_D256=0`) | mask-driven |
 |---|---:|---:|
-| 4 x ~2.6k tokens, burst | 903 tok/s | 956 tok/s |
-| 4 x ~2.6k tokens, TP2 | 397 tok/s | 394 tok/s |
-| 4 x ~10k tokens, chunked (each prompt spans 3 ubatches) | 799 tok/s | **1031 tok/s (+29%)** |
+| 4 x ~2.6k, one V100 | 903 tok/s | 956 tok/s |
+| 4 x ~1.7k, 2 x V100 TP2 | 1491 tok/s | 1530 tok/s |
+| 4 x ~10k chunked (each prompt spans 3 ubatches), one V100 | 799 tok/s | **1031 tok/s (+29%)** |
+| 4 x 16k, one V100 | 646 tok/s | **902 tok/s (+40%)** |
+| 4 x 16k, 2 x V100 TP2 | 966 - 1000 tok/s | **1343 - 1396 tok/s (+39%)** |
 
 At 2-3k tokens attention is a small share and the two are within noise; at 10k,
 where the prefill is chunked and each slot's cells arrive in several runs
@@ -172,10 +174,10 @@ tail read hit. Fixed by assigning on the out-of-range columns.
 page-in of ~11 GB happens inside the first prefill: 28.4 s vs 2.7 s for the same
 1682-token prompt. The gate now sends a warm-up request before timing.
 
-**TP2 at 3k context is not faster than one card** (397 vs 903 tok/s aggregate
-for 4 concurrent requests) - for both builds, so it is pre-existing: at short
-context attention is a small share and TP2 pays the allreduce at two boundaries
-per layer.
+**TP2 pays, once it is really TP2.** On two V100s over NVLink the same 4 x ~1.7k
+workload is 1530 vs 956 tok/s for one card (+60%). An earlier revision of this
+section reported the opposite; that came from measuring one V100 plus the RTX
+3080 instead of the TP2 pair.
 
 ## 6. Not done (v2 candidates)
 
@@ -220,16 +222,30 @@ gone; `LLAMA_SM70_D256_DEC_WMAX` is a measured-performance ceiling (default 16,
 the launch configuration when a unified pool runs several slots - a value the
 user set wins.
 
-Measured, 4 slots on one V100 (one token per slot without speculation, 4 tokens
-with MTP-3):
+Measured, 4 slots (one token per slot, no speculation), **decode with a single
+request in flight** - the only number that compares the kernels rather than the
+scheduler:
 
 | workload | stock | mask-driven + TC decode |
 |---|---:|---:|
-| decode at ~0.9k context, w=4 | 19.9 tok/s | 18.4 tok/s (**-7%**) |
-| decode at ~16k context, w=4 | 1.5 / 0.9 / 13.7 / 3.1 tok/s | 2.4 / 1.4 / 16.0 / 5.2 tok/s |
-| prefill 4 x 16k | 646 tok/s | 902 tok/s (+40%) |
+| decode at ~0.9k, one V100 | 19.9 tok/s | 18.4 tok/s (**-7%**) |
+| decode at ~0.9k, 2 x V100 TP2 | 28.4 tok/s | 24.9 tok/s (**-12%**) |
+| decode at ~16k, 2 x V100 TP2 | 41.6 / 41.7 / 41.8 / 41.6 tok/s | 42.0 / 42.1 / 42.0 / 41.9 tok/s (+1%) |
 
-So the TC decode kernel is the wrong tool at short context (the weight stream
-dominates and the KV split only adds overhead) and the right one at depth - the
-same crossover the single-sequence path has, just shifted by the wider ubatch.
-The ceiling exists to keep that from being decided by an arbitrary 8.
+Read that as: under a unified pool the TC decode kernel is **not a win in this
+depth range**. Below ~1k it is a clear loss (the weight stream dominates and the
+KV split only adds overhead); by 16k it is a wash. The +20-30% this kernel shows
+on the single-sequence path was measured at 174k, a depth none of these
+configurations reach.
+
+A warning about the method, because it produced a wrong conclusion here once:
+with four slots decoding at the same time the per-request rate swings by 3-7x
+within one run (3.2 to 23.6 tok/s), because the rate depends on how many slots
+are still alive. Those burst numbers look like a large win for either build
+depending on which slot you read. Only the solo column means anything.
+
+So the value of this work is coverage and coherence - one code path for every
+batch shape, no silent fallback - not decode throughput. What is missing is a
+depth threshold: decode should fall back to stock below some measured kv_len, and
+none of these runs says where that line is (it is above 16k and below 174k, and
+finding it costs a long-context sweep).

@@ -414,6 +414,10 @@ def main():
               f"in {wall:.1f}s -> {n_prompt / wall:7.0f} prompt tok/s aggregate "
               f"(per request: " + " ".join(f"{t:.0f}" for t in runs[tag]["tps"]) + ")")
         print(f"  [{tag}] decode per request: " + " ".join(f"{d:.1f}" for d in dec) + " tok/s")
+        # Solo decode = one request in flight, so no slot contention: the only
+        # number that compares the two kernels rather than the scheduler.
+        dsolo = [r["timings"]["predicted_per_second"] for r in runs[tag]["solo"]]
+        print(f"  [{tag}] decode solo (1 in flight): " + " ".join(f"{d:.1f}" for d in dsolo) + " tok/s")
 
     print("\n" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
