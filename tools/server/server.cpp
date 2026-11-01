@@ -175,14 +175,49 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     }
 
     // sm70-attn: with a unified KV cache and more than one slot, one ubatch can hold
-    // tokens of several sequences (and then the mask row of a query is not a contiguous
-    // visible prefix). The D256 kernels implement a single-sequence causal mask, so the
-    // CUDA backend is told once, here - it is a process-wide property, and probing the
-    // mask per node would need a device-to-host sync per attention node.
+    // tokens of several sequences, and the visibility of a key is then only known from
+    // the KQ mask (another sequence's cells sit between a row's own). The CUDA backend
+    // is told once, here - it is a process-wide property, and probing the mask per node
+    // would need a device-to-host sync per attention node. The prefill kernels switch
+    // to a mask-driven path; decode stays on the stock path.
+    // A value the user set himself wins, so LLAMA_SM70_D256_MULTI_SEQ=0 keeps the
+    // whole process on stock.
     if (!is_router_server && params.kv_unified && params.n_parallel > 1) {
-        common_set_env("LLAMA_SM70_D256_MULTI_SEQ", "1");
-        SRV_WRN("%s%c", "unified KV with >1 slots: the SM70 D256 attention kernels "
-                        "are disabled (they assume one sequence per batch)", 10);
+        const std::string multi_seq = common_get_env("LLAMA_SM70_D256_MULTI_SEQ");
+        if (multi_seq.empty()) {
+            common_set_env("LLAMA_SM70_D256_MULTI_SEQ", "1");
+            SRV_INF("%s%c", "unified KV with >1 slots: the SM70 D256 kernels read the "
+                            "KQ mask for both prefill and decode", 10);
+        } else {
+            SRV_WRN("unified KV with >1 slots, but LLAMA_SM70_D256_MULTI_SEQ=%s is "
+                    "already set - leaving it alone%c", multi_seq.c_str(), 10);
+            if (multi_seq != "1") {
+                // Anything but 1 means the mask-driven path stays off, and the
+                // position-based causal path is wrong on a shared pool: it
+                // would read the other slots' cells as if they were this
+                // sequence's own prefix. The user asked for an escape hatch, so
+                // give them stock rather than silently wrong numbers.
+                SRV_WRN("  -> forcing LLAMA_SM70_D256=0 for this process: the "
+                        "position-based kernels cannot describe a shared pool%c", 10);
+                common_set_env("LLAMA_SM70_D256", "0");
+            }
+        }
+        // The decode ubatch is slots x (1 + drafts) tokens wide, so the TC
+        // decode kernel's width ceiling follows the launch configuration rather
+        // than a hardcoded 8. The backend also accepts a value the user set.
+        if (common_get_env("LLAMA_SM70_D256_DEC_WMAX").empty()) {
+            bool spec_on = false;
+            for (auto t : params.speculative.types) {
+                if (t != COMMON_SPECULATIVE_TYPE_NONE) { spec_on = true; break; }
+            }
+            const int drafts = spec_on ? params.speculative.draft.n_max : 0;
+            // Capped at 8: wider decode batches are not verified yet (see
+            // sm70_d256_dec_wmax), so they must keep falling back to stock.
+            const int dec_w  = std::min(params.n_parallel * (1 + drafts), 8);
+            common_set_env("LLAMA_SM70_D256_DEC_WMAX", std::to_string(dec_w));
+            SRV_INF("decode width ceiling: %d (n_parallel %d x (1 + %d drafts))\n",
+                    dec_w, params.n_parallel, drafts);
+        }
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c

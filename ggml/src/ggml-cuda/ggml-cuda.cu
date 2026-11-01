@@ -1328,14 +1328,46 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     if (comm_ctx_v == nullptr) {
         return false;
     }
+    // TP communication probe (LLAMA_SM70_TP_TIMING): the wall time of every
+    // allreduce, so the gap between two-card scaling and 2x can be attributed
+    // to communication rather than guessed at. Forces a sync per call, so it
+    // measures a slow path - use it to size the budget, not to benchmark.
+    static const bool s_tp_timing = getenv("LLAMA_SM70_TP_TIMING") != nullptr;
+    static double s_tp_ms = 0.0;
+    static long   s_tp_n  = 0;
+    cudaEvent_t ev0 = nullptr;
+    cudaEvent_t ev1 = nullptr;
+    if (s_tp_timing) {
+        cudaEventCreate(&ev0);
+        cudaEventCreate(&ev1);
+        cudaEventRecord(ev0);
+    }
+
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     // The one-shot P2P path only claims small, contiguous F32 messages; anything it
     // declines falls through to the mode chosen by the init chain.
+    bool ok = false;
     if (comm_ctx->p2p_ar != nullptr &&
             ggml_cuda_p2p_ar_allreduce(comm_ctx->p2p_ar, comm_ctx->backends.data(), tensors)) {
-        return true;
+        ok = true;
+    } else {
+        ok = comm_ctx->try_allreduce(comm_ctx, tensors);
     }
-    return comm_ctx->try_allreduce(comm_ctx, tensors);
+
+    if (s_tp_timing) {
+        cudaEventRecord(ev1);
+        cudaEventSynchronize(ev1);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev0, ev1);
+        s_tp_ms += ms;
+        if (++s_tp_n % 200 == 0) {
+            fprintf(stderr, "[tp-timing] allreduce calls=%ld total=%.1f ms avg=%.3f ms\n",
+                    s_tp_n, s_tp_ms, s_tp_ms / (double) s_tp_n);
+        }
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+    }
+    return ok;
 }
 
 // host buffer type

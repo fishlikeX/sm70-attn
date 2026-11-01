@@ -40,6 +40,8 @@
 #include "sm70-vendor/flash/mask.h"
 #include "sm70-vendor/flash/philox.cuh"
 
+#include "fattn-sm70-d256-maskmd.cuh"
+
 namespace FLASH_NAMESPACE {
 
 using namespace cute;
@@ -625,8 +627,13 @@ __device__ __forceinline__ int64_t paged_kv_thread_offset(
 // sm70_q8_fill_kv — see the q8 dequant block above for layout + rounding.
 // The two flags are mutually exclusive per tensor (K is either q4-direct or
 // q8-direct or f16).
+// MaskMD: unified KV pool, several sequences per batch. Visibility then comes
+// from the KQ mask tensor instead of the bottom-right causal formula, and the
+// scan window is derived from per-row first/last visible cells (row_lo/row_hi)
+// instead of a single kv_offset. See fattn-sm70-d256-maskmd.cuh.
 template <typename Element, bool PagedKV, typename ElementOut = Element, bool SplitKV3 = false,
-          bool Kq4 = false, bool Vq4 = false, bool Kq8 = false, bool Vq8 = false>
+          bool Kq4 = false, bool Vq4 = false, bool Kq8 = false, bool Vq8 = false,
+          bool MaskMD = false>
 __global__ __launch_bounds__(Sm70D256SplitDTraits::kNThreads, 1)
 void sm70_d256_splitd_dense_kernel(
     const Element *__restrict__ q,
@@ -648,13 +655,23 @@ void sm70_d256_splitd_dense_kernel(
     int heads_kv,
     int kv_offset,
     const half *__restrict__ mask_last_q,
+    const half *__restrict__ mask_kv,
+    int64_t mask_kv_stride,
+    int mask_kv_rows,
+    const int *__restrict__ row_lo,
+    const int *__restrict__ row_hi,
     float softmax_scale_log2,
     const int *__restrict__ block_table,
     int page_size,
     int block_table_batch_stride,
     float *__restrict__ partial_out,
     float *__restrict__ partial_max,
-    float *__restrict__ partial_sum) {
+    float *__restrict__ partial_sum,
+    // MaskMD only: per (query row, 32-column block) state, one byte each;
+    // null keeps the plain f16 mask path (and is what every other instantiation
+    // passes).
+    const uint8_t *__restrict__ mask_state,
+    int mask_state_stride) {
     using Traits = Sm70D256SplitDTraits;
     static_assert(!(PagedKV && (Kq4 || Vq4 || Kq8 || Vq8)),
                   "q4/q8-direct implements the dense (non-paged) path only");
@@ -741,9 +758,10 @@ void sm70_d256_splitd_dense_kernel(
         // SplitKV3: a row's causal window may not overlap this segment at all
         // (fully-masked row) — keep row_max finite so exp2 never sees
         // (-inf) - (-inf) = NaN. -1e30 behaves as -inf under exp2 (flushes to
-        // zero) and the merge kernel's scale stays 0. The dense path keeps
+        // zero) and the merge kernel's scale stays 0. MaskMD needs the same
+        // guard: a row can be empty in the scanned window. The dense path keeps
         // -INFINITY (every row always sees causal block 0 there).
-        row_max[row] = SplitKV3 ? -1.0e30f : -INFINITY;
+        row_max[row] = (SplitKV3 || MaskMD) ? -1.0e30f : -INFINITY;
         row_sum[row] = 0.0f;
     }
 
@@ -754,33 +772,82 @@ void sm70_d256_splitd_dense_kernel(
     // live key count from the last query row's mask - the same monotone probe the
     // decode kernel uses - and derive the base from it. Everything below reads
     // kv_offset, so overwrite it here.
-    if (mask_last_q != nullptr) {
-        int lo = 0;
-        int hi = kv_len;
-        while (lo < hi) {
-            const int mid = (lo + hi) >> 1;
-            if (__half2float(mask_last_q[mid]) > -30000.0f) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+    if constexpr (!MaskMD) {
+        if (mask_last_q != nullptr) {
+            int lo = 0;
+            int hi = kv_len;
+            while (lo < hi) {
+                const int mid = (lo + hi) >> 1;
+                if (__half2float(mask_last_q[mid]) > -30000.0f) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
-        }
-        kv_offset = lo - query_len;
-        if (kv_offset < 0) {
-            kv_offset = 0;
+            kv_offset = lo - query_len;
+            if (kv_offset < 0) {
+                kv_offset = 0;
+            }
         }
     }
 
-    const int max_kv_for_tile = query_row_base + kBlockM + kv_offset;
-    const int n_block_limit = max_kv_for_tile < kv_len
-        ? max_kv_for_tile
-        : kv_len;
-    const int visible_n_blocks = cute::ceil_div(n_block_limit, kBlockN);
     int n_block_min = 0;
-    int n_block_max = visible_n_blocks - 1;
+    int n_block_max = 0;
+    if constexpr (MaskMD) {
+        // The mask decides visibility, so the scan window is the union of the
+        // visible cells of this tile's kBlockM rows. Both ends are exact:
+        // nothing before the first or after the last visible cell can
+        // contribute, and other sequences' runs in between are dropped by the
+        // mask itself.
+        int col_last = -1;
+        int col_first = kv_len;
+        for (int r = 0; r < kBlockM; ++r) {
+            int rr = query_row_base + r;
+            if (rr >= mask_kv_rows) {
+                rr = mask_kv_rows - 1;
+            }
+            const int hi_r = row_hi[rr];
+            const int lo_r = row_lo[rr];
+            if (hi_r > col_last) {
+                col_last = hi_r;
+            }
+            if (lo_r < col_first) {
+                col_first = lo_r;
+            }
+        }
+        if (col_last >= 0) {
+            // ceil((col_last + 1) / kBlockN) - 1, and the block holding col_first
+            n_block_max = (col_last + kBlockN) / kBlockN - 1;
+            n_block_min = col_first / kBlockN;
+        } else {
+            // No visible cell anywhere in this tile: an empty window. The loop
+            // body never runs and every row keeps its -1e30 / 0 statistics, which
+            // the merge kernel already guards.
+            n_block_max = -1;
+            n_block_min = 0;
+        }
+    } else {
+        const int max_kv_for_tile = query_row_base + kBlockM + kv_offset;
+        const int n_block_limit = max_kv_for_tile < kv_len
+            ? max_kv_for_tile
+            : kv_len;
+        n_block_min = 0;
+        n_block_max = cute::ceil_div(n_block_limit, kBlockN) - 1;
+    }
     if constexpr (SplitKV3) {
-        n_block_min = visible_n_blocks * split / 3;
-        n_block_max = visible_n_blocks * (split + 1) / 3 - 1;
+        // Disjoint contiguous thirds of the window. Their union is the window
+        // itself, so every visible cell lands in exactly one split whichever way
+        // the window was derived (causal bound or mask bounds).
+        // Under MaskMD the window is per tile and can be tiny (two contiguous
+        // sequences of a fresh pool are a handful of blocks apart), where
+        // tripling the CTA count for nothing would cost more than it saves: below
+        // 6 blocks split 0 takes the whole window and 1, 2 write neutral
+        // partials, which the merge already guards.
+        const int span = n_block_max - n_block_min + 1;
+        const int base = n_block_min;
+        const int ns = (MaskMD && span < 6) ? 1 : 3;
+        n_block_min = base + (span > 0 ? span * split / ns : 0);
+        n_block_max = base + (span > 0 ? span * (split + 1) / ns : 0) - 1;
     }
     // SplitKV3 guard: an empty split segment (n_block_max < n_block_min) must
     // still load a valid first tile to keep the gmem addresses in range; use
@@ -983,13 +1050,24 @@ void sm70_d256_splitd_dense_kernel(
             copy_even_tile(gmem_v_copy, tVgV2, tVrV1);
         }
 
-        FLASH_NAMESPACE::Mask<true, false, false> mask(
-            kv_len, kv_len - kv_offset, -1, 0, 0.0f);
-        mask.template apply_mask<true, true>(
-            acc_s,
-            n_block * kBlockN,
-            query_row_base + qk_row_base,
-            0);
+        if constexpr (MaskMD) {
+            // One mask element per (query row, cell): the only place the unified
+            // pool's visibility enters this kernel.
+            FLASH_NAMESPACE::MaskFromKV mask_kv_md(mask_kv, mask_kv_stride, kv_len, mask_kv_rows,
+                                                   mask_state, mask_state_stride);
+            mask_kv_md.apply_mask(
+                acc_s,
+                n_block * kBlockN,
+                query_row_base + qk_row_base);
+        } else {
+            FLASH_NAMESPACE::Mask<true, false, false> mask(
+                kv_len, kv_len - kv_offset, -1, 0, 0.0f);
+            mask.template apply_mask<true, true>(
+                acc_s,
+                n_block * kBlockN,
+                query_row_base + qk_row_base,
+                0);
+        }
         Element *p_smem_ptr =
             kv_smem_ptr + 2 * Traits::kKVElements;
         float *row_scale_exchange = reinterpret_cast<float *>(

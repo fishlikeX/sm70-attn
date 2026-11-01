@@ -1293,6 +1293,19 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         const auto & cells = v_cells[sinfo.strm[s]];
 
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+
+        // Fragmentation probe (LLAMA_SM70_KV_OCC): n_kv follows used_max_p1, so
+        // holes left by finished or rolled-back sequences make every per-ubatch
+        // cost - the KQ mask upload above all - scale with the high-water mark
+        // instead of with the live data.
+        static const bool s_occ = getenv("LLAMA_SM70_KV_OCC") != nullptr;
+        if (s_occ) {
+            const uint32_t live = cells.get_used();
+            const uint32_t mp1  = cells.used_max_p1();
+            fprintf(stderr, "[kv-occ] size=%u live=%u max_p1=%u ratio=%.2f n_kv=%u\n",
+                    (unsigned) cells.size(), (unsigned) live, (unsigned) mp1,
+                    live ? (double) mp1 / (double) live : 0.0, (unsigned) result);
+        }
     }
 
     return result;

@@ -446,8 +446,11 @@ def check(model: dict | None, args: dict, env: dict) -> list[str]:
     except (TypeError, ValueError):
         np_ = 1
     if np_ > 1 and str(env.get("LLAMA_SM70_D256", "1")) != "0":
-        warns.append("np > 1：D256 内核只实现单序列因果，混批会自动回落 stock"
-                     "（单序列批仍走内核；要恒定速度就设 LLAMA_SM70_D256=0）。")
+        # Multi-slot is no longer a blanket fallback: with a unified pool the
+        # prefill kernels switch to the mask-driven path, decode stays stock.
+        warns.append("np > 1：统一 KV 池下预填充走 mask 驱动（service 端自动置 "
+                     "LLAMA_SM70_D256_MULTI_SEQ=1，无需手动）；未开 -kvu 的 per-seq 混批"
+                     "（Q/K 的 ne[3] > 1）仍回落 stock；解码一律回落 stock。")
     if str(args.get("split_mode")) == "tensor":
         n = len([x for x in str(env.get("CUDA_VISIBLE_DEVICES", "")).split(",") if x != ""])
         if n < 2:

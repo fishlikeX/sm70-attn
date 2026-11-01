@@ -225,9 +225,12 @@ static void launch_attn(
             /*v_row_stride  */ Vq4 ? (int) (hkv * 144) : (int) (hkv * D),
             /*v_head_stride */ Vq4 ? 144 : D,
             q_pad, kv_len, heads_q, hkv, kv_offset,
-            (const half *) mask_last_q, softmax_scale_log2,
+            (const half *) mask_last_q,
+            nullptr, 0, 0, nullptr, nullptr,
+            softmax_scale_log2,
             nullptr, 0, 0,
-            partial_out, partial_max, partial_sum);
+            partial_out, partial_max, partial_sum,
+            nullptr, 0);
     CK(cudaGetLastError());
 }
 
