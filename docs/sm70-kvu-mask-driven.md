@@ -285,6 +285,9 @@ drafts: the freed cells are handed out again, the mask layout differs, and a
 greedy token flips where the top-2 gap is small. That is a hypothesis, not a
 measurement.
 
+KV quantization is not the cause: the same shape with an f16 K and V cache gave
+tuned 41 / stock 41, unchanged from the q4_0 numbers.
+
 Consequence for the ceiling: it is still 8, because widths above it were never
 verified for this kernel - but it does not, by itself, make wide verify batches
 reproducible, since stock flakes on them too. Single-token multi-slot decode
