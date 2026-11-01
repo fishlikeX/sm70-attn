@@ -73,6 +73,8 @@ class Server:
         ]
         if args.tp == 2:
             argv += ["-sm", "tensor"]
+        if args.mtp:
+            argv += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(args.mtp)]
         if args.decode:
             env["LLAMA_SM70_D256_DECODE"] = "1"
             env["LLAMA_SM70_D256_DEC_Q4"] = "1"
@@ -80,6 +82,9 @@ class Server:
             env["LLAMA_SM70_D256_DEBUG"] = "1"
         if args.cuda_devices:
             env["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
+        for kv in args.env:
+            k, _, v = kv.partition("=")
+            env[k] = v
         self.argv = argv
         self.env = env
         self.proc = None
@@ -230,7 +235,7 @@ def main():
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--cuda-devices", default="")
     ap.add_argument("--pattern", default="burst", choices=["burst", "stagger"])
-    ap.add_argument("--prompts", default="same", choices=["same", "hetero", "long"],
+    ap.add_argument("--prompts", default="same", choices=["same", "hetero", "long", "gen", "genlong"],
                     help="same: identical prompts, so every slot sees the same "
                          "composition and the greedy stream is a hard assertion. "
                          "hetero: different lengths, the composition legitimately "
@@ -239,7 +244,12 @@ def main():
     ap.add_argument("--n-probs", type=int, default=5)
     ap.add_argument("--tol", type=float, default=1e-3)
     ap.add_argument("--decode", action="store_true", help="enable the D256 decode kernel env")
+    ap.add_argument("--mtp", type=int, default=0,
+                    help="speculative draft-mtp with this n-max (0 = off)")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--env", action="append", default=[],
+                    help="KEY=VALUE passed to the server process, repeatable "
+                         "(e.g. --env LLAMA_SM70_SKINNY=2)")
     ap.add_argument("--logdir", default=os.environ.get("TEMP", "/tmp"))
     ap.add_argument("--skip-solo", action="store_true")
     ap.add_argument("--repeat", type=int, default=0,
@@ -249,6 +259,18 @@ def main():
 
     if args.prompts == "same":
         texts = [make_prompt(40, "S")] * args.np
+    elif args.prompts == "gen":
+        # Generation-heavy: the decode kernel is only measurable when the model
+        # actually emits more than the stop token. No "reply with OK" tail here,
+        # or the model says OK and stops.
+        filler = "".join(f"G-{i}: {FILLER}" for i in range(20))
+        texts = [filler + "\nList the numbers from 1 to 120, one per line, then stop.\n"
+                 for _ in range(args.np)]
+    elif args.prompts == "genlong":
+        # long context + real generation: the decode kernel's home turf
+        filler = "".join(f"X-{i}: {FILLER}" for i in range(380))
+        texts = [filler + "\nList the numbers from 1 to 120, one per line, then stop.\n"
+                 for _ in range(args.np)]
     elif args.prompts == "long":
         # > n_batch, so one slot's prefill spans several ubatches and the slots'
         # chunks interleave in them - the most fragmented cell layout there is.
@@ -313,7 +335,18 @@ def main():
             _, d, _, _ = compare(runs[tag]["burst"][i], runs[tag]["burst2"][i], args.tol)
             noise = max(noise, d)
     thr = max(args.tol, 2.0 * noise)
-    print(f"\n  scheduling noise floor (same build, same pattern, twice): {noise:.2e} -> threshold {thr:.2e}")
+    # Rank swaps the same build shows against itself, at the same significance
+    # threshold the tuned-vs-stock comparison uses. A decode-heavy workload can
+    # move the top-5 by several nats between runs, and then a handful of swaps is
+    # the expected count, not a defect - the control is what says how many.
+    ctrl_flips = 0
+    for tag in runs:
+        for i in range(len(texts)):
+            _, _, f, _ = compare(runs[tag]["burst"][i], runs[tag]["burst2"][i],
+                                 args.tol, flip_thr=noise)
+            ctrl_flips = max(ctrl_flips, f)
+    print(f"\n  scheduling noise floor (same build, same pattern, twice): {noise:.2e} "
+          f"-> threshold {thr:.2e}, control rank swaps at that threshold: {ctrl_flips}")
 
     if args.repeat:
         print(f"\n=== repeat: {args.repeat + 2} bursts per build, each against the first ===")
@@ -343,7 +376,7 @@ def main():
     for i in range(len(texts)):
         mism, max_d, flips, ties = compare(runs["tuned"]["burst"][i], runs["stock"]["burst"][i],
                                            args.tol, flip_thr=noise)
-        bad = (hard_tokens and mism > 0) or max_d > thr or flips > 1
+        bad = (hard_tokens and mism > 0) or max_d > thr or flips > max(ctrl_flips, 1)
         ok = ok and not bad
         print(f"  req {i}: prompt_n={runs['tuned']['burst'][i]['timings']['prompt_n']:5d} "
               f"tok_mismatch={mism:3d} max|dlogp|={max_d:.2e} rank_flips={flips} ties={ties}"
@@ -376,9 +409,11 @@ def main():
     n_prompt = sum(r["timings"]["prompt_n"] for r in runs["tuned"]["burst"])
     for tag in ("stock", "tuned"):
         wall = burst_wall[tag]
+        dec = [r["timings"]["predicted_per_second"] for r in runs[tag]["burst"]]
         print(f"  [{tag}] {n_prompt} prompt tokens + {args.n_predict} generated x{len(texts)} "
               f"in {wall:.1f}s -> {n_prompt / wall:7.0f} prompt tok/s aggregate "
               f"(per request: " + " ".join(f"{t:.0f}" for t in runs[tag]["tps"]) + ")")
+        print(f"  [{tag}] decode per request: " + " ".join(f"{d:.1f}" for d in dec) + " tok/s")
 
     print("\n" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
