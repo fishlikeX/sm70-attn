@@ -229,7 +229,8 @@ static void launch_attn(
             nullptr, 0, 0, nullptr, nullptr,
             softmax_scale_log2,
             nullptr, 0, 0,
-            partial_out, partial_max, partial_sum);
+            partial_out, partial_max, partial_sum,
+            nullptr, 0);
     CK(cudaGetLastError());
 }
 

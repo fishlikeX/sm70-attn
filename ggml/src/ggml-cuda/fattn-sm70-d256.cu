@@ -781,11 +781,16 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
     const size_t bounds_size = sm70_maskmd(K, V, dst->src[3])
         ? GGML_PAD((size_t) 2 * Q->ne[1] * sizeof(int), 128)
         : 0;
+    // Mask state: one byte per (query row, 32-cell block), same layout the
+    // launcher carves after the bounds arrays.
+    const size_t state_size = sm70_maskmd(K, V, dst->src[3])
+        ? GGML_PAD((size_t) Q->ne[1] * (((int) dst->src[3]->ne[0] + 31) / 32), 128)
+        : 0;
     return ggml_nbytes(dst) + GGML_PAD(f16_extra_size, 128)
          + (size_t) nQ * sizeof(half) + (size_t) nQ * sizeof(float)
          + GGML_PAD((size_t) 3 * rows3 * SM70_D256_D * sizeof(float)
                     + 2 * (size_t) 3 * rows3 * sizeof(float), 128)
-         + bounds_size;
+         + bounds_size + state_size;
 }
 
 void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1009,8 +1014,21 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                                 + 2 * (size_t) 3 * rows3 * sizeof(float);
     int * row_lo = (int *) ((char *) partial_out + GGML_PAD(partials_bytes, 128));
     int * row_hi = row_lo + q_len;
+    // Mask state: one byte per (query row, 32-cell block). Sits right after the
+    // bounds arrays; get_alloc_size reserves the same amount.
+    const int mask_state_stride = (kv_len + 31) / 32;
+    uint8_t * mask_state = (uint8_t *) (row_hi + q_len);
 
     if (mask_md) {
+        // Condense the f16 mask to one byte per (row, 32-cell block) once per
+        // node. Without it every head CTA re-reads the whole f16 mask; with it a
+        // block that is entirely visible or entirely hidden costs one byte and
+        // no f16 traffic at all.
+        FLASH_NAMESPACE::sm70_mask_state_kernel<<<q_len, 256, 0, stream>>>(
+                (const half *) mask->data, (int64_t) mask->ne[0], kv_len, q_len,
+                mask_state, mask_state_stride, mask_state_stride);
+        CUDA_CHECK(cudaGetLastError());
+
         // One small kernel for the whole node: the per-row first/last visible
         // cell do not depend on the head, so the hkv*gqa CTAs share them.
         FLASH_NAMESPACE::sm70_mask_row_bounds_kernel<<<q_len, 256, 0, stream>>>(
@@ -1050,7 +1068,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 nullptr, 0, 0,
                 use_splitkv3 ? partial_out : nullptr,
                 use_splitkv3 ? partial_max : nullptr,
-                use_splitkv3 ? partial_sum : nullptr);
+                use_splitkv3 ? partial_sum : nullptr,
+                mask_state, mask_state_stride);
     } else if (use_splitkv3) {
         const auto kfn = kfn_tbl[1][k_mode * 3 + v_mode];
         kfn<<<grid, block, Traits::kSmemBytes, stream>>>(
@@ -1076,7 +1095,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 nullptr, 0, 0, nullptr, nullptr,
                 softmax_scale_log2,
                 nullptr, 0, 0,
-                partial_out, partial_max, partial_sum);
+                partial_out, partial_max, partial_sum,
+                nullptr, 0);
     } else {
         const auto kfn = kfn_tbl[0][k_mode * 3 + v_mode];
         kfn<<<grid, block, Traits::kSmemBytes, stream>>>(
@@ -1102,7 +1122,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 nullptr, 0, 0, nullptr, nullptr,
                 softmax_scale_log2,
                 nullptr, 0, 0,
-                nullptr, nullptr, nullptr);
+                nullptr, nullptr, nullptr,
+                nullptr, 0);
     }
     CUDA_CHECK(cudaGetLastError());
 

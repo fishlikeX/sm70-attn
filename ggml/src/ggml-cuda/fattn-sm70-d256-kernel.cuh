@@ -666,7 +666,12 @@ void sm70_d256_splitd_dense_kernel(
     int block_table_batch_stride,
     float *__restrict__ partial_out,
     float *__restrict__ partial_max,
-    float *__restrict__ partial_sum) {
+    float *__restrict__ partial_sum,
+    // MaskMD only: per (query row, 32-column block) state, one byte each;
+    // null keeps the plain f16 mask path (and is what every other instantiation
+    // passes).
+    const uint8_t *__restrict__ mask_state,
+    int mask_state_stride) {
     using Traits = Sm70D256SplitDTraits;
     static_assert(!(PagedKV && (Kq4 || Vq4 || Kq8 || Vq8)),
                   "q4/q8-direct implements the dense (non-paged) path only");
@@ -1048,7 +1053,8 @@ void sm70_d256_splitd_dense_kernel(
         if constexpr (MaskMD) {
             // One mask element per (query row, cell): the only place the unified
             // pool's visibility enters this kernel.
-            FLASH_NAMESPACE::MaskFromKV mask_kv_md(mask_kv, mask_kv_stride, kv_len, mask_kv_rows);
+            FLASH_NAMESPACE::MaskFromKV mask_kv_md(mask_kv, mask_kv_stride, kv_len, mask_kv_rows,
+                                                   mask_state, mask_state_stride);
             mask_kv_md.apply_mask(
                 acc_s,
                 n_block * kBlockN,

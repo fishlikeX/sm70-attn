@@ -200,7 +200,8 @@ static int run_case(const Case & tc, bool verbose) {
     CK(cudaMemcpy(lo_d.data(), dLo, q_len * sizeof(int), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(hi_d.data(), dHi, q_len * sizeof(int), cudaMemcpyDeviceToHost));
 
-    int bounds_bad = 0;
+    int  bounds_bad = 0;
+    bool state_bad  = false;   // condensed state vs plain f16 path, bitwise
     for (int r = 0; r < q_len; ++r) {
         if (lo_d[r] != lo_h[r] || hi_d[r] != hi_h[r]) {
             if (bounds_bad < 5) {
@@ -232,34 +233,68 @@ static int run_case(const Case & tc, bool verbose) {
     CK(cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
     const dim3 grid(q_pad / Traits::kBlockM, tc.split3 ? 3 : 1, HQ);
     const dim3 block(Traits::kNThreads);
-    kfn<<<grid, block, Traits::kSmemBytes, 0>>>(
-            (const El *) dQ, (const El *) dK, (const El *) dV, dO,
-            /*q_batch_stride*/ (int64_t) HQ * q_pad * D,
-            /*q_row_stride  */ D,
-            /*q_head_stride */ (int64_t) q_pad * D,
-            /*k_outer_stride*/ 0,
-            /*k_row_stride  */ HKV * D,
-            /*k_head_stride */ D,
-            /*v_outer_stride*/ 0,
-            /*v_row_stride  */ HKV * D,
-            /*v_head_stride */ D,
-            q_pad, n_kv, HQ, HKV,
-            /*kv_offset  */ 0,
-            /*mask_last_q*/ nullptr,
-            (const half *) dM, (int64_t) n_kv, q_len,
-            dLo, dHi,
-            scale_log2,
-            nullptr, 0, 0,
-            dP_out, dP_max, dP_sum);
+
+    // The condensed state, exactly as the launcher builds it.
+    const int state_stride = (n_kv + 31) / 32;
+    uint8_t * dS = nullptr;
+    CK(cudaMalloc(&dS, (size_t) q_len * state_stride));
+    FLASH_NAMESPACE::sm70_mask_state_kernel<<<q_len, 256, 0, 0>>>(
+            (const half *) dM, (int64_t) n_kv, n_kv, q_len, dS, state_stride, state_stride);
     CK(cudaGetLastError());
-    if (tc.split3) {
-        FLASH_NAMESPACE::sm70_d256_splitkv3_merge_kernel
-            <<<dim3((unsigned) rows3), Traits::kHeadDim, 0, 0>>>(
-                (const float *) dP_out, (const float *) dP_max,
-                (const float *) dP_sum, dO, rows3, scale_log2);
+
+    auto launch = [&](const uint8_t * st, float * out) {
+        kfn<<<grid, block, Traits::kSmemBytes, 0>>>(
+                (const El *) dQ, (const El *) dK, (const El *) dV, out,
+                /*q_batch_stride*/ (int64_t) HQ * q_pad * D,
+                /*q_row_stride  */ D,
+                /*q_head_stride */ (int64_t) q_pad * D,
+                /*k_outer_stride*/ 0,
+                /*k_row_stride  */ HKV * D,
+                /*k_head_stride */ D,
+                /*v_outer_stride*/ 0,
+                /*v_row_stride  */ HKV * D,
+                /*v_head_stride */ D,
+                q_pad, n_kv, HQ, HKV,
+                /*kv_offset  */ 0,
+                /*mask_last_q*/ nullptr,
+                (const half *) dM, (int64_t) n_kv, q_len,
+                dLo, dHi,
+                scale_log2,
+                nullptr, 0, 0,
+                dP_out, dP_max, dP_sum,
+                st, st ? state_stride : 0);
         CK(cudaGetLastError());
-    }
+        if (tc.split3) {
+            FLASH_NAMESPACE::sm70_d256_splitkv3_merge_kernel
+                <<<dim3((unsigned) rows3), Traits::kHeadDim, 0, 0>>>(
+                    (const float *) dP_out, (const float *) dP_max,
+                    (const float *) dP_sum, out, rows3, scale_log2);
+            CK(cudaGetLastError());
+        }
+    };
+    launch(dS, dO);
+    // Same kernel, plain f16 mask path: the condensed state must not change a
+    // single bit, so this is compared exactly, not against a tolerance.
+    float * dO_no = nullptr;
+    CK(cudaMalloc(&dO_no, (size_t) q_pad * HQ * D * sizeof(float)));
+    launch(nullptr, dO_no);
     CK(cudaDeviceSynchronize());
+    {
+        const size_t n = (size_t) q_pad * HQ * D;
+        std::vector<float> a(n), b(n);
+        CK(cudaMemcpy(a.data(), dO,    n * sizeof(float), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(b.data(), dO_no, n * sizeof(float), cudaMemcpyDeviceToHost));
+        size_t ndiff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (memcmp(&a[i], &b[i], sizeof(float)) != 0) { ++ndiff; }
+        }
+        printf("  [%s] state vs f16 path: %zu/%zu bits differ\n", tc.name, ndiff, n);
+        if (ndiff != 0) {
+            printf("  [%s] FAIL: the condensed mask state changed the output\n", tc.name);
+            state_bad = true;
+        }
+        cudaFree(dO_no);
+    }
 
     std::vector<float> Oh((size_t) q_pad * HQ * D);
     CK(cudaMemcpy(Oh.data(), dO, Oh.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -344,13 +379,13 @@ static int run_case(const Case & tc, bool verbose) {
     printf("case %-18s nseq=%d n_kv=%5d q_len=%4d pad=%4d | bounds: %-6s | max|err|=%.3e  >1e-2: %6d  nan/inf: %d %s\n",
            tc.name, tc.nseq, n_kv, q_len, q_pad, bounds_bad ? "FAIL" : "ok",
            max_abs, bad, nan_out,
-           (bad || nan_out || bounds_bad) ? "  <-- FAIL" : "");
+           (bad || nan_out || bounds_bad || state_bad) ? "  <-- FAIL" : "");
 
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dM); cudaFree(dO);
-    cudaFree(dLo); cudaFree(dHi);
+    cudaFree(dLo); cudaFree(dHi); cudaFree(dS);
     if (dP_out) { cudaFree(dP_out); cudaFree(dP_max); cudaFree(dP_sum); }
     (void) verbose;
-    return (bad || nan_out || bounds_bad) ? 1 : 0;
+    return (bad || nan_out || bounds_bad || state_bad) ? 1 : 0;
 }
 
 int main(int argc, char ** argv) {

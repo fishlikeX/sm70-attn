@@ -23,11 +23,61 @@
 // ============================================================================
 #pragma once
 
+#include <cstdint>
+
 #include <cuda_fp16.h>
 
 #include "sm70-vendor/flash/mask.h"
 
 namespace FLASH_NAMESPACE {
+
+// ---- per-(row, 32-column block) state, one byte each -----------------------
+// Reading the f16 mask per head CTA costs hkv*gqa passes over [n_q][n_kv]: for
+// an 8k prefill that is 3.2 GB per node against 32 KB of K+V per block, i.e.
+// the 12.5% tax. The state array condenses it to one byte per (row, block),
+// which is 1/32 of the mask, is shared by all head CTAs (and stays in L2), and
+// lets the kernel skip both the f16 read and the per-element add.
+//
+// Values, chosen so that zeroed memory is the safe path:
+//   0 MIXED   - some cells hidden, some visible: read the f16 mask as before
+//   1 VISIBLE - every cell in the block is 0.0 (adding 0 leaves the score
+//               bit-identical, so the whole block-add can be skipped)
+//   2 HIDDEN  - every cell is exactly -inf (assign -inf instead of adding it)
+// Classification is exact, never approximate: only all-zero counts as VISIBLE
+// and only all -inf counts as HIDDEN; anything else, including graded masks
+// (ALiBi) or a short trailing block, falls back to the f16 path.
+enum : uint8_t { kMaskStateMixed = 0, kMaskStateVisible = 1, kMaskStateHidden = 2 };
+
+// One block per query row; each thread owns whole 32-cell blocks.
+static __global__ void sm70_mask_state_kernel(
+        const half * __restrict__ mask, int64_t row_stride, int n_kv, int q_len,
+        uint8_t * __restrict__ state, int state_stride, int n_blocks) {
+    const int r = blockIdx.x;
+    if (r >= q_len) {
+        return;
+    }
+    const half * row = mask + (int64_t) r * row_stride;
+    uint8_t * out = state + (int64_t) r * state_stride;
+    for (int b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+        const int c0 = b * 32;
+        bool all_zero = true;
+        bool all_neg = true;
+        for (int c = c0; c < c0 + 32; ++c) {
+            // Columns past n_kv are outside the tensor and are masked out by
+            // definition, so a block that straddles the end is never VISIBLE.
+            const float v = (c < n_kv) ? __half2float(row[c]) : -INFINITY;
+            if (v != 0.0f) {
+                all_zero = false;
+            }
+            if (!(v == -INFINITY)) {
+                all_neg = false;
+            }
+        }
+        out[b] = all_zero ? kMaskStateVisible
+               : all_neg  ? kMaskStateHidden
+                          : kMaskStateMixed;
+    }
+}
 
 // Per query row: first and last cell the KQ mask leaves visible over the whole
 // padded key range. One block per row, run once per attention node so the
@@ -80,13 +130,16 @@ static __global__ void sm70_mask_row_bounds_kernel(
 }
 
 struct MaskFromKV {
-    const half * base;      // KQ mask, f16, [n_q][n_kv]
-    int64_t      row_stride;
-    int          n_kv;      // columns >= n_kv are outside the tensor, dropped as -inf
-    int          n_q;       // real query rows; padding rows of the last tile clamp to n_q - 1
+    const half *   base;      // KQ mask, f16, [n_q][n_kv]
+    int64_t        row_stride;
+    int            n_kv;      // columns >= n_kv are outside the tensor, dropped as -inf
+    int            n_q;       // real query rows; padding rows of the last tile clamp to n_q - 1
+    const uint8_t *state;     // per (row, block) state, may be null
+    int            state_stride;
 
-    __forceinline__ __device__ MaskFromKV(const half * b, const int64_t rs, const int kv, const int q)
-        : base(b), row_stride(rs), n_kv(kv), n_q(q) {}
+    __forceinline__ __device__ MaskFromKV(const half * b, const int64_t rs, const int kv, const int q,
+                                          const uint8_t * st = nullptr, const int ss = 0)
+        : base(b), row_stride(rs), n_kv(kv), n_q(q), state(st), state_stride(ss) {}
 
     template <bool Is_even_MN = false, typename Engine, typename Layout>
     __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> & tensor_,
@@ -128,6 +181,16 @@ struct MaskFromKV {
                 if (row_idx >= n_q) {
                     row_idx = n_q - 1;
                 }
+                // Whole-block shortcut: the state is per (row, block) and the
+                // block index is the caller's column offset / kBlockN.
+                uint8_t st = kMaskStateMixed;
+                if (state != nullptr && kBlockN == 32) {
+                    st = state[(int64_t) row_idx * state_stride + (col_idx_offset_ / kBlockN)];
+                }
+                if (st == kMaskStateVisible) {
+                    // Every cell adds 0.0: the score stays bit-identical.
+                    continue;
+                }
                 const half * row_ptr = base + (int64_t) row_idx * row_stride;
                 #pragma unroll
                 for (int n = 0; n < size<1, 2>(tensor); ++n) {
@@ -137,7 +200,11 @@ struct MaskFromKV {
                         for (int j = 0; j < size<1, 0>(tensor); ++j) {
                             const int col_idx = sm70_mask_col_idx<kBlockN>(lane_col_base, col_idx_offset_, j, nj, n);
                             auto coord = make_coord(make_coord(i, mi), make_coord(j, nj, n));
-                            if (col_idx < n_kv) {
+                            if (st == kMaskStateHidden) {
+                                // Adding -inf and assigning -inf give the same
+                                // value, so the f16 read can be skipped.
+                                tensor(coord) = -INFINITY;
+                            } else if (col_idx < n_kv) {
                                 tensor(coord) += __half2float(row_ptr[col_idx]);
                             } else {
                                 // Past the live key range: the last tile is rounded

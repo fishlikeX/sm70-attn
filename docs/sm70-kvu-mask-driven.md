@@ -179,12 +179,33 @@ workload is 1530 vs 956 tok/s for one card (+60%). An earlier revision of this
 section reported the opposite; that came from measuring one V100 plus the RTX
 3080 instead of the TP2 pair.
 
-## 6. Not done (v2 candidates)
+## 6. Mask traffic: one byte per (row, 32-cell block)
 
-- **Mask traffic.** Precompute a 2-bit state per (row, 32-column block)
-  (all hidden / mixed / all visible) once per node: ~0.5 MB at 8k x 8k, resident
-  in L2, and blocks that are all visible skip the f16 read entirely. Drops the
-  mask cost by two orders of magnitude. Not needed while 12.5% is affordable.
+The f16 mask is read once per head CTA, so an 8k prefill reads it 24 times: 4 KB
+per block against 32 KB of K+V, the 12.5% tax. `sm70_mask_state_kernel` condenses
+it once per node into one byte per (row, block):
+
+| state | kernel does | cost |
+|---|---|---|
+| `VISIBLE` (every cell is 0.0) | nothing - adding 0 leaves the score bit-identical | 1 byte |
+| `HIDDEN` (every cell is exactly -inf) | assigns -inf instead of adding it | 1 byte |
+| `MIXED` | reads the f16 mask as before | 1 byte + 4 KB |
+
+Every classification is exact, never approximate: only all-zero counts as
+VISIBLE and only all -inf as HIDDEN, so a graded mask (ALiBi), a short trailing
+block, or anything unrecognised falls into MIXED and behaves exactly as before.
+The state array is 1/32 of the mask, is shared by all head CTAs and stays in L2,
+which takes the tax from 12.5% to about 0.2%. A 2-bit packing would take it to
+0.05%, which is not worth the cross-thread packing.
+
+The harness proves the claim rather than arguing it: each case runs the kernel
+twice, once with the state and once with the plain f16 path, and compares the
+outputs with `memcmp`. All 8 cases report **0 of N bits differ**, and the
+28-case battery still reports the error values it had before.
+
+On the wall clock the change is below the noise of a 10k-token burst (the tax was
+worth ~1% there by arithmetic); it should be worth ~3.8% at 46k and ~7.6% at
+174k, which needs a longer run than the one that shipped with this.
 
 ## 7. Phase 2: decode, SplitKV3, q4/q8-direct
 
