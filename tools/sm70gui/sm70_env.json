@@ -242,6 +242,36 @@
       "group": "debug", "tier": "advanced", "risk": "debug",
       "desc": "How many times SM70_DUMP may fire (default 4096).",
       "desc_zh": "SM70_DUMP 最多抓多少次（默认 4096）。"
+    },
+    {
+      "name": "LLAMA_SM70_D256_MULTI_SEQ", "default": "", "kind": "text",
+      "group": "d256", "tier": "advanced", "risk": "careful",
+      "desc": "Leave empty and llama-server decides: with -kvu and more than one slot it switches the prefill kernels to the mask-driven path. 1 forces that path, 0 forces the whole process onto stock. Do not set 0 while running a shared pool with several slots unless you also accept stock - the position-based kernels cannot describe a shared pool.",
+      "desc_zh": "留空由 llama-server 判断：-kvu 且槽位大于 1 时自动切到 mask 驱动路径。1 强制走该路径，0 强制整进程回到 stock。注意：不要在共享池多槽下单独设 0 却仍指望内核可用——位置公式无法描述共享池。"
+    },
+    {
+      "name": "LLAMA_SM70_D256_DEC_WMAX", "default": "", "kind": "text",
+      "group": "d256", "tier": "advanced", "risk": "careful",
+      "desc": "Width ceiling for the TC decode kernel. Leave empty: the server derives it from slots x (1 + drafts) and caps it at 8. Only decode batches of at most this many tokens use the kernel.",
+      "desc_zh": "TC 解码 kernel 的宽度上限。留空则由 server 按 槽位 x (1 + 草稿) 推导并封顶 8。只有不超过该 token 数的解码批才会走该 kernel。"
+    },
+    {
+      "name": "LLAMA_NEAR_TIE_EPS", "default": "", "kind": "text",
+      "group": "d256", "tier": "advanced", "risk": "careful",
+      "desc": "Deterministic near-tie resolution, in nats. Empty = off. When set (0.25 is the measured value), greedy requests whose top-2 margin is below it pick the smaller token id instead of the argmax, so two runs of the same request stop disagreeing where the candidates are within the run-to-run drift (~0.2 nat). Applies only to temp 0 and requests that do not ask for probabilities, and it does change the output versus stock.",
+      "desc_zh": "确定性近似平手裁决，单位 nat。留空 = 关闭。设 0.25（实测值）后，贪心请求在 top-2 差距小于该值时改取较小的 token id，使同一请求两次运行不再在“候选差距小于漂移（约 0.2 nat）”处翻字。仅对温度 0 且不索取概率的请求生效，且会改变输出。"
+    },
+    {
+      "name": "LLAMA_SM70_KV_OCC", "default": "0", "kind": "bool",
+      "group": "debug", "tier": "advanced", "risk": "debug",
+      "desc": "Print per-ubatch KV pool occupancy (size, live cells, high-water mark, ratio). A ratio near 1 means no fragmentation, so the KQ mask stays proportional to the data actually held.",
+      "desc_zh": "每个 ubatch 打印 KV 池占用（容量、活 cell、高水位、比值）。比值≈1 表示没有碎片，KQ mask 的开销只随实际持有数据增长。"
+    },
+    {
+      "name": "LLAMA_SM70_TP_TIMING", "default": "0", "kind": "bool",
+      "group": "debug", "tier": "advanced", "risk": "debug",
+      "desc": "Print accumulated allreduce wall time over tensor parallel. Forces a device sync on every allreduce, so it slows the run down measurably - use it to size the communication budget, never to benchmark.",
+      "desc_zh": "统计张量并行下 allreduce 的累计墙钟时间。每条 allreduce 都强制同步，开启后明显变慢——只用于估算通信预算，不要用它跑性能数。"
     }
   ]
 }

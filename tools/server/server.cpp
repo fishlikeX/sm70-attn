@@ -191,6 +191,16 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         } else {
             SRV_WRN("unified KV with >1 slots, but LLAMA_SM70_D256_MULTI_SEQ=%s is "
                     "already set - leaving it alone%c", multi_seq.c_str(), 10);
+            if (multi_seq != "1") {
+                // Anything but 1 means the mask-driven path stays off, and the
+                // position-based causal path is wrong on a shared pool: it
+                // would read the other slots' cells as if they were this
+                // sequence's own prefix. The user asked for an escape hatch, so
+                // give them stock rather than silently wrong numbers.
+                SRV_WRN("  -> forcing LLAMA_SM70_D256=0 for this process: the "
+                        "position-based kernels cannot describe a shared pool%c", 10);
+                common_set_env("LLAMA_SM70_D256", "0");
+            }
         }
         // The decode ubatch is slots x (1 + drafts) tokens wide, so the TC
         // decode kernel's width ceiling follows the launch configuration rather
