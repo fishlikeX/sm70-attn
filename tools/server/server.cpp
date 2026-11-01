@@ -175,14 +175,23 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     }
 
     // sm70-attn: with a unified KV cache and more than one slot, one ubatch can hold
-    // tokens of several sequences (and then the mask row of a query is not a contiguous
-    // visible prefix). The D256 kernels implement a single-sequence causal mask, so the
-    // CUDA backend is told once, here - it is a process-wide property, and probing the
-    // mask per node would need a device-to-host sync per attention node.
+    // tokens of several sequences, and the visibility of a key is then only known from
+    // the KQ mask (another sequence's cells sit between a row's own). The CUDA backend
+    // is told once, here - it is a process-wide property, and probing the mask per node
+    // would need a device-to-host sync per attention node. The prefill kernels switch
+    // to a mask-driven path; decode stays on the stock path.
+    // A value the user set himself wins, so LLAMA_SM70_D256_MULTI_SEQ=0 keeps the
+    // whole process on stock.
     if (!is_router_server && params.kv_unified && params.n_parallel > 1) {
-        common_set_env("LLAMA_SM70_D256_MULTI_SEQ", "1");
-        SRV_WRN("%s%c", "unified KV with >1 slots: the SM70 D256 attention kernels "
-                        "are disabled (they assume one sequence per batch)", 10);
+        const std::string multi_seq = common_get_env("LLAMA_SM70_D256_MULTI_SEQ");
+        if (multi_seq.empty()) {
+            common_set_env("LLAMA_SM70_D256_MULTI_SEQ", "1");
+            SRV_INF("%s%c", "unified KV with >1 slots: prefill uses the mask-driven "
+                            "SM70 D256 kernels, decode stays on stock", 10);
+        } else {
+            SRV_WRN("unified KV with >1 slots, but LLAMA_SM70_D256_MULTI_SEQ=%s is "
+                    "already set - leaving it alone%c", multi_seq.c_str(), 10);
+        }
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c

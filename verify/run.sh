@@ -24,7 +24,7 @@ mode="${1:-n}"
 # The harness is valid ONLY against the exact kernel that was static-audited.
 # If the repo drifted, fail loudly instead of producing unverifiable numbers.
 kmd5="$(tr -d '\r' < "$cuda/fattn-sm70-d256-kernel.cuh" | md5sum | cut -d' ' -f1)"   # CRLF-normalized
-expect="0e49bfdd895a27953f4e0ea0bc12bd3f"   # fattn-sm70-d256-kernel.cuh @ PR #3 merge (q8-direct added; q4/f16 paths unchanged) — audit: q8 dequant + Kq8/Vq8 branch only
+expect="3e53e7ba73f412f29d86bd873adbf88b"   # fattn-sm70-d256-kernel.cuh @ kvu-mask-driven (2026-11-01) — audit: MaskMD param + mask_kv/row_lo/row_hi, non-MaskMD path unchanged
 if [ "$kmd5" != "$expect" ]; then
     echo "kernel md5 drift: $kmd5 != $expect" >&2
     echo "— audit the diff / update the harness before trusting any numbers" >&2

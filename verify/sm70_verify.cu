@@ -414,7 +414,7 @@ static int run_case(const Case& tc, bool oob) {
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
-            q_pad, kvlen, heads_q, hkv, kv_offset, nullptr, scale_log2, nullptr, 0, 0,
+            q_pad, kvlen, heads_q, hkv, kv_offset, nullptr, nullptr, 0, 0, nullptr, nullptr, scale_log2, nullptr, 0, 0,
             dPout, dPmax, dPsum);
         CK(cudaGetLastError());
         FLASH_NAMESPACE::sm70_d256_splitkv3_merge_kernel
@@ -436,7 +436,7 @@ static int run_case(const Case& tc, bool oob) {
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
-            q_pad, kvlen, heads_q, hkv, kv_offset, nullptr, scale_log2, nullptr, 0, 0,
+            q_pad, kvlen, heads_q, hkv, kv_offset, nullptr, nullptr, 0, 0, nullptr, nullptr, scale_log2, nullptr, 0, 0,
             nullptr, nullptr, nullptr);
     } else {
         kernel<<<grid, block, Traits::kSmemBytes, 0>>>(
@@ -444,7 +444,7 @@ static int run_case(const Case& tc, bool oob) {
             (int64_t) heads_q * q_pad * D, D, (int64_t) q_pad * D,
             k_outer, k_row_stride, k_head_stride,
             v_outer, v_row_stride, v_head_stride,
-            q_pad, kvlen, heads_q, hkv, kv_offset, nullptr, scale_log2, nullptr, 0, 0,
+            q_pad, kvlen, heads_q, hkv, kv_offset, nullptr, nullptr, 0, 0, nullptr, nullptr, scale_log2, nullptr, 0, 0,
             nullptr, nullptr, nullptr);
     }
     CK(cudaGetLastError());
