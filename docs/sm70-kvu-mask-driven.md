@@ -272,9 +272,21 @@ none of these runs says where that line is (it is above 16k and below 174k, and
 finding it costs a long-context sweep).
 
 Verified widths for the mask-driven decode: w=4 (4 slots x 1 token) and w=8
-(2 slots x 4) reproduce bit-identically across repeated runs. w=16 (4 slots x 4
-tokens, MTP-3) does not reproduce - and once the ceiling below sends those nodes
-to stock, the same instability shows up on the stock build as well, so it is a
-property of that launch shape, not of this kernel. The ceiling is 8 for that
-reason: it keeps the unverified shape out, and llama-server caps its adaptive
-value there.
+(2 slots x 4) reproduce bit-identically across repeated runs.
+
+**Wide verify batches are not reproducible, and this kernel is not the cause.**
+Two identical bursts of 4 slots x 2 tokens (w=8) gave, on consecutive runs:
+tuned 0 / stock 38 token mismatch, then tuned 41 / stock 40. The stock build
+never executes a line of this code, so the flakiness belongs to the
+multi-slot + speculative-verify combination in llama.cpp - the failing side
+changes from run to run, which is the signature of a scheduling effect rather
+than an arithmetic one. A likely mechanism is the KV rollback after rejected
+drafts: the freed cells are handed out again, the mask layout differs, and a
+greedy token flips where the top-2 gap is small. That is a hypothesis, not a
+measurement.
+
+Consequence for the ceiling: it is still 8, because widths above it were never
+verified for this kernel - but it does not, by itself, make wide verify batches
+reproducible, since stock flakes on them too. Single-token multi-slot decode
+(w = slots) and narrow verify (2 slots x 4) are the shapes that were shown
+stable.
