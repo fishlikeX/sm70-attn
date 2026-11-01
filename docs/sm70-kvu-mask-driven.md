@@ -207,6 +207,33 @@ On the wall clock the change is below the noise of a 10k-token burst (the tax wa
 worth ~1% there by arithmetic); it should be worth ~3.8% at 46k and ~7.6% at
 174k, which needs a longer run than the one that shipped with this.
 
+### A 1.2M-cell pool is not the disaster it looks like
+
+The mask is `[n_kv][q_len]` f16 and is uploaded from host memory every ubatch.
+On this box the host link is PCIe 3.0 x4, measured at **3.3 GB/s** (pageable and
+pinned identical, so it is link-bound, not driver-bound). If `n_kv` tracked the
+pool capacity, a 1.2M-cell pool would upload 1.2M x 2048 x 2 B = 4.9 GB per
+ubatch, i.e. 1.5 s each, and prefill would be dead.
+
+It does not. `n_kv = PAD(used_max_p1)` - the highest *used* cell index - and
+`find_slot` restarts from index 0 whenever the allocation head drifts past the
+live count plus two batches, so a pool that is far from full never accumulates a
+high-water mark. Measured with `LLAMA_SM70_KV_OCC=1` over a 131072-cell pool:
+
+```
+[kv-occ] size=131072 live=10511 max_p1=10511 ratio=1.00 n_kv=10752
+```
+
+Every sample reads ratio 1.00. The mask therefore scales with the data actually
+held, not with the pool, and defrag is unnecessary outside a nearly-full pool -
+where the problem is capacity, not compaction.
+
+Confirmed end to end on 2 x V100 (TP2) with a 1.2M-cell pool, 4 slots x 16k:
+stock 1071 tok/s aggregate, mask-driven **1477 tok/s (+38%)**, the same as the
+32k-pool numbers. The single-card run of the same configuration OOMs, which is
+expected: 1.2M cells need 1.2M x 40 layers x 512 x 0.56 B = 13.7 GB of KV on top
+of an 11 GB model, so that pool size implies TP2.
+
 ## 7. Phase 2: decode, SplitKV3, q4/q8-direct
 
 **SplitKV3** now composes with the mask window. The kernel used to split the
