@@ -24,7 +24,7 @@ $md5 = {
     $bytes = [Text.Encoding]::UTF8.GetBytes($raw)
     (Get-FileHash -Algorithm MD5 -InputStream (New-Object IO.MemoryStream(,$bytes))).Hash.ToLower()
 }
-$kmd5  = $md5 "$root\fattn-sm70-d256-kernel.cuh"
+$kmd5  = & $md5 "$root\fattn-sm70-d256-kernel.cuh"
 $expect = "3e53e7ba73f412f29d86bd873adbf88b"     # fattn-sm70-d256-kernel.cuh @ kvu-mask-driven, LF-normalized (2026-11-01) - MaskMD template param + mask_kv/row_lo/row_hi params; the non-MaskMD instantiation is untouched
 if ($kmd5 -ne $expect) { throw "kernel md5 drift: $kmd5 != $expect — rebuild the harness audit before trusting results" }
 Write-Host ("kernel md5 ok: " + $kmd5)
@@ -32,7 +32,10 @@ Write-Host ("kernel md5 ok: " + $kmd5)
 $bin  = Join-Path $PSScriptRoot "sm70_verify.exe"
 
 Write-Host "== build =="
-& nvcc -O2 -std=c++17 -arch=sm_70 -I "$inc" -I "$root" "$PSScriptRoot\sm70_verify.cu" -o "$bin"
+# Windows/MSVC quirks the WSL build (run.sh) gets for free: /Zc:__cplusplus is
+# what makes __cplusplus report C++17 (cutlass platform keys is_unsigned_v off
+# it), and math.h there does not define M_LOG2E for the vendored softmax.
+& nvcc -O2 -std=c++17 -arch=sm_70 -Xcompiler "/Zc:__cplusplus /utf-8" "-DM_LOG2E=1.4426950408889634f" -I "$inc" -I "$root" "$PSScriptRoot\sm70_verify.cu" -o "$bin"
 if ($LASTEXITCODE -ne 0) { throw "nvcc build failed" }
 
 Write-Host "== device check =="
