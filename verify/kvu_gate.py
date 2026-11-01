@@ -205,6 +205,9 @@ def near_tie_report(a, b, label):
         if ia[p] == ib[p]:
             continue
         ma, mb = la[p], lb[p]
+        if not ma or not mb:
+            print(f"    {label} first flip @ {p}: no probabilities reported, cannot classify")
+            return
         gap_a = (ma[0][1] - ma[1][1]) if len(ma) > 1 else float("inf")
         gap_b = (mb[0][1] - mb[1][1]) if len(mb) > 1 else float("inf")
         da, db = dict(ma), dict(mb)

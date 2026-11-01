@@ -647,6 +647,48 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr, &cur_p);
     }
 
+    // Deterministic near-tie resolution, opt-in through LLAMA_NEAR_TIE_EPS.
+    //
+    // With greedy decoding two runs of the same request can still pick
+    // different tokens when the batch composition differs between them: the
+    // GEMM tiling changes, the logits move by ~0.2 nat, and wherever the top-2
+    // margin is smaller than that the winner is decided by accumulation order
+    // rather than by the model. Measured at the first divergence of three
+    // concurrent requests, the margins were 0.237/0.106/0.090 against a drift
+    // of 0.160/0.155/0.211 - all close calls.
+    //
+    // So: when the best candidate is within eps of the second, keep the one
+    // with the smaller token id and drop the rest. The choice then depends on
+    // the logits only through "which tokens are within eps", which the drift
+    // cannot reorder. Disabled unless the variable is set, and only for greedy
+    // requests that do not report probabilities (pruning would leave the
+    // reported top_logprobs with a single survivor).
+    static const float s_tie_eps = [] {
+        const char * e = getenv("LLAMA_NEAR_TIE_EPS");
+        const float v = e ? (float) atof(e) : 0.0f;
+        return v > 0.0f ? v : 0.0f;
+    }();
+    if (s_tie_eps > 0.0f && gsmpl->params.temp == 0.0f && gsmpl->params.n_probs == 0) {
+        float best = -INFINITY;
+        for (size_t i = 0; i < cur_p.size; ++i) {
+            best = std::max(best, cur_p.data[i].logit);
+        }
+        llama_token keep = LLAMA_TOKEN_NULL;
+        for (size_t i = 0; i < cur_p.size; ++i) {
+            if (cur_p.data[i].logit >= best - s_tie_eps &&
+                (keep == LLAMA_TOKEN_NULL || cur_p.data[i].id < keep)) {
+                keep = cur_p.data[i].id;
+            }
+        }
+        if (keep != LLAMA_TOKEN_NULL) {
+            for (size_t i = 0; i < cur_p.size; ++i) {
+                if (cur_p.data[i].id != keep) {
+                    cur_p.data[i].logit = -INFINITY;
+                }
+            }
+        }
+    }
+
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;

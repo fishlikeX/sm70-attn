@@ -311,3 +311,23 @@ verified for this kernel - but it does not, by itself, make wide verify batches
 reproducible, since stock flakes on them too. Single-token multi-slot decode
 (w = slots) and narrow verify (2 slots x 4) are the shapes that were shown
 stable.
+
+### Making the decision reproducible: LLAMA_NEAR_TIE_EPS
+
+Since the flips happen only where the margin is smaller than the drift, the
+cheap fix is at the decision, not at the batching: when the best candidate is
+within `eps` of the second, keep the smaller token id and drop the rest. Which
+token wins then depends on the logits only through "who is within eps", a set
+the drift cannot reorder.
+
+Set `LLAMA_NEAR_TIE_EPS=0.25` (nat). It is off by default, applies only to
+greedy requests (`temp == 0`) that do not ask for probabilities, and changes the
+output relative to stock wherever a near-tie occurs - it is a reproducibility
+patch, not a correctness one, and it is also the only change in this document
+that affects the stock path.
+
+Measured on the shape that reliably flaked (4 slots x 2 tokens): without the
+variable, two identical bursts differed by 38-41 tokens in 2 of 4 runs; with it,
+three consecutive runs all reported 0 of 64. The eps comes from the table above
+(drift ~0.2 nat), so it prunes only genuine coin flips; setting it in the 1-2
+nat range would rewrite tokens the model actually preferred.
