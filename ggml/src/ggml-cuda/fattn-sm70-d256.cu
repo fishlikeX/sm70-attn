@@ -395,6 +395,20 @@ static bool sm70_d256_dec_q4_direct() {
     return on;
 }
 
+// Ceiling on the token width the TC decode kernel takes. Its cost model is
+// "rows = tokens x GQA packed into 32-row passes", so a wider ubatch is more
+// work per CTA but also more parallelism; there is no structural limit, only a
+// measured one. The default covers the launch configurations we ship (slots x
+// (1 + drafts)); llama-server raises it to exactly that product when a unified
+// pool runs several slots, and 0 means no ceiling at all.
+static int sm70_d256_dec_wmax() {
+    static const int w = [] {
+        const char * e = getenv("LLAMA_SM70_D256_DEC_WMAX");
+        return e ? atoi(e) : 16;
+    }();
+    return w;
+}
+
 static int sm70_d256_dec_splits(int kv_len, int hkv) {
     // Adaptive split count from the clean-GPU2 sweep (GSQ, TP2, spec):
     //   22k: 24 splits = 90.6, 43 splits = 84.9  (fewer better at shallow-mid)
@@ -478,21 +492,38 @@ static void ggml_cuda_flash_attn_ext_sm70_d256_decode(ggml_backend_cuda_context 
     // mask (n_kv, q_len) f16: the last query row spans every live key.
     const half * mask_last_q = (const half *) mask->data + (int64_t) (q_len - 1) * mask->ne[0];
     const int64_t mask_q_stride = 1;   // k contiguous within a query row
-    auto launch = [&](auto kk4, auto vv4) {
+    // Unified pool with several slots: the batch's rows belong to different
+    // sequences, so visibility comes from the mask per TOKEN row.
+    const bool mask_md_dec = sm70_maskmd(K, V, mask);
+    const half * mask_kv = mask_md_dec ? (const half *) mask->data : nullptr;
+    const int64_t mask_kv_stride = mask_md_dec ? (int64_t) mask->ne[0] : 0;
+    auto launch = [&](auto kk4, auto vv4, auto mm) {
+        constexpr bool K4 = decltype(kk4)::value;
+        constexpr bool V4 = decltype(vv4)::value;
+        constexpr bool MM = decltype(mm)::value;
         if (gqa == 6) {
-            sm70_d256_decode::sm70_d256_decode_kernel<6, kk4, vv4><<<grid, 128, 0, stream>>>(
+            sm70_d256_decode::sm70_d256_decode_kernel<6, K4, V4, MM><<<grid, 128, 0, stream>>>(
                 (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
-                q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l);
+                q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
+                mask_kv, mask_kv_stride);
         } else {
-            sm70_d256_decode::sm70_d256_decode_kernel<8, kk4, vv4><<<grid, 128, 0, stream>>>(
+            sm70_d256_decode::sm70_d256_decode_kernel<8, K4, V4, MM><<<grid, 128, 0, stream>>>(
                 (const float *) Q->data, q_row, q_head, K_h2, V_h2, k_row, k_head, v_row, v_head,
-                q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l);
+                q_len, kv_len, scale, splits, mask_last_q, mask_q_stride, partial_acc, partial_m, partial_l,
+                mask_kv, mask_kv_stride);
         }
     };
-    if (k_direct && v_direct)      { launch(std::true_type{}, std::true_type{}); }
-    else if (k_direct)             { launch(std::true_type{}, std::false_type{}); }
-    else if (v_direct)             { launch(std::false_type{}, std::true_type{}); }
-    else                           { launch(std::false_type{}, std::false_type{}); }
+    const int dec_mode = (k_direct ? 1 : 0) | (v_direct ? 2 : 0) | (mask_md_dec ? 4 : 0);
+    switch (dec_mode) {
+        case 0: launch(std::false_type{}, std::false_type{}, std::false_type{}); break;
+        case 1: launch(std::true_type{},  std::false_type{}, std::false_type{}); break;
+        case 2: launch(std::false_type{}, std::true_type{},  std::false_type{}); break;
+        case 3: launch(std::true_type{},  std::true_type{},  std::false_type{}); break;
+        case 4: launch(std::false_type{}, std::false_type{}, std::true_type{});  break;
+        case 5: launch(std::true_type{},  std::false_type{}, std::true_type{});  break;
+        case 6: launch(std::false_type{}, std::true_type{},  std::true_type{});  break;
+        default: launch(std::true_type{}, std::true_type{},  std::true_type{});  break;
+    }
     CUDA_CHECK(cudaGetLastError());
     {
         static bool once = [] { return getenv("LLAMA_SM70_D256_DEBUG") != nullptr; }();
@@ -565,24 +596,22 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
                           && (V->type != GGML_TYPE_F16 || V->nb[0] == sizeof(half));
         // w==1 routes to stock: the SIMT vec kernel is the single-row optimum
         // (measured -3..-6% for the TC kernel at width 1); the TC kernel owns
-        // verify widths w>=2 where GQA row packing + tensor-core math pay
-        // (measured +20.5% (f16 V) / +30.8% (q4 V) at 174k spec-verify).
-        const bool ok_d = Q->ne[1] >= 2 && Q->ne[1] <= 8 && mask && Q->ne[3] == 1 && K->ne[3] == 1
+        // widths w>=2 where GQA row packing + tensor-core math pay (measured
+        // +20.5% (f16 V) / +30.8% (q4 V) at 174k spec-verify).
+        // No hard ceiling any more: the width of a ubatch under -kvu is
+        // slots x (1 + drafts), which the kernel loops over in 32-row passes.
+        // WMAX is the measured-performance ceiling, not a structural one.
+        const int wmax = sm70_d256_dec_wmax();
+        const bool ok_d = Q->ne[1] >= 2 && (wmax <= 0 || Q->ne[1] <= wmax)
+                       && mask && Q->ne[3] == 1 && K->ne[3] == 1
                        && Q->ne[2] % K->ne[2] == 0 && (gqa_d == 6 || gqa_d == 8) && kv_ok_d;
         if (ok_d) {
-            if (sm70_multi_seq_hint()) {
-                // v1: a unified pool with several slots keeps decode on the
-                // stock path. This kernel carries one kv_offset for all rows
-                // (bottom-right causal base), which a slot-interleaved batch
-                // breaks: q_len is the number of ubatch tokens, and under -np N
-                // those tokens belong to N different sequences.
-                sm70_d256_probe("REJECT: decode stays stock under unified KV", cc, Q, K, V, mask);
-                return false;
-            }
-            sm70_d256_probe("ACCEPT: sm70 d256 decode kernel", cc, Q, K, V, mask);
+            sm70_d256_probe(sm70_maskmd(K, V, mask)
+                                ? "ACCEPT: sm70 d256 decode kernel + mask-driven"
+                                : "ACCEPT: sm70 d256 decode kernel", cc, Q, K, V, mask);
             return true;
         }
-        if (Q->ne[1] <= 8) {
+        if (Q->ne[1] <= (wmax > 0 ? wmax : 32)) {
             sm70_d256_probe("REJECT: decode shape not eligible (gqa/batch/types)", cc, Q, K, V, mask);
             return false;
         }
@@ -690,8 +719,13 @@ size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
+        // MUST mirror the width window of the decode branch in _supported(): a
+        // node the gate sends to the decode launcher has to be sized for it, or
+        // the launcher writes its splits past the allocation.
+        const int wmax_alloc = sm70_d256_dec_wmax();
         if (sm70_d256_decode_enabled() && Q->ne[0] == SM70_D256_D
-                && Q->ne[1] >= 1 && Q->ne[1] <= 8 && Q->ne[3] == 1) {
+                && Q->ne[1] >= 1 && (wmax_alloc <= 0 || Q->ne[1] <= wmax_alloc)
+                && Q->ne[3] == 1) {
             const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
             // MUST be the same predicate the decode launcher uses (it decides with
             // sm70_d256_dec_q4_direct / LLAMA_SM70_D256_DEC_Q4, independent of the

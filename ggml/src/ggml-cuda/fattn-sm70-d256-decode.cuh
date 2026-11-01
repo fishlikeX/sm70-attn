@@ -201,7 +201,7 @@ __device__ __forceinline__ void sm70_dec_q4_dequant8(
     }
 }
 
-template <int GQA, bool Kq4 = false, bool Vq4 = false>
+template <int GQA, bool Kq4 = false, bool Vq4 = false, bool MaskMD = false>
 __global__ void __launch_bounds__(kDecThreads, 2) sm70_d256_decode_kernel(
         const float * __restrict__ q,             // f32 (D, q_len, heads_q, 1)
         int64_t q_row_stride, int64_t q_head_stride,
@@ -214,7 +214,12 @@ __global__ void __launch_bounds__(kDecThreads, 2) sm70_d256_decode_kernel(
         int q_len, int kv_len, float scale, int splits,
         const half * __restrict__ mask_last_q, int64_t mask_q_stride,
         float * __restrict__ partial_acc, float * __restrict__ partial_m,
-        float * __restrict__ partial_l) {
+        float * __restrict__ partial_l,
+        // MaskMD (unified pool): visibility per TOKEN row, read from the mask -
+        // the kernel's single kv_offset cannot describe a batch whose rows
+        // belong to different sequences.
+        const half * __restrict__ mask_kv = nullptr,
+        int64_t mask_kv_stride = 0) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
     __shared__ __align__(16) half q_s[kDecBr * kDecSmemStride];
     __shared__ __align__(16) half k_s[kDecBc * kDecSmemStride];
@@ -243,7 +248,13 @@ __global__ void __launch_bounds__(kDecThreads, 2) sm70_d256_decode_kernel(
     // probes replace the linear scan (which re-read 458KB per CTA — 44MB/step
     // across the grid at 229k capacity, a measured ~10% decode tax).
     int live = 0;
-    {
+    if constexpr (MaskMD) {
+        // Every row has its own visible set, so there is no single boundary to
+        // probe: scan the capacity and let the mask drop what is invisible.
+        // Cost check: the mask read is 2 B against 512 B of K+V per (row, key),
+        // and only the rows this CTA owns are read.
+        live = kv_len;
+    } else {
         int lo = 0, hi = kv_len;   // invariant: mask[lo-1] valid, mask[hi] invalid
         while (lo < hi) {
             const int mid = (lo + hi) >> 1;
@@ -367,7 +378,10 @@ __global__ void __launch_bounds__(kDecThreads, 2) sm70_d256_decode_kernel(
                     const int col = d_get_j(l);
                     const int key = sub_k0 + col;
                     const int token = (row_base + row) / GQA;
-                    const bool ok = row < rows_here && key < k_end && key <= kv_offset + token;
+                    const bool seen = MaskMD
+                        ? __half2float(mask_kv[(int64_t) token * mask_kv_stride + key]) > -30000.0f
+                        : key <= kv_offset + token;
+                    const bool ok = row < rows_here && key < k_end && seen;
                     ds[l] = ok ? ds[l] * scale : -CUDART_INF_F;
                 }
                 // per-row max over the 8 keys: two rows live in this thread

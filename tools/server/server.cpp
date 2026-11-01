@@ -186,11 +186,25 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         const std::string multi_seq = common_get_env("LLAMA_SM70_D256_MULTI_SEQ");
         if (multi_seq.empty()) {
             common_set_env("LLAMA_SM70_D256_MULTI_SEQ", "1");
-            SRV_INF("%s%c", "unified KV with >1 slots: prefill uses the mask-driven "
-                            "SM70 D256 kernels, decode stays on stock", 10);
+            SRV_INF("%s%c", "unified KV with >1 slots: the SM70 D256 kernels read the "
+                            "KQ mask for both prefill and decode", 10);
         } else {
             SRV_WRN("unified KV with >1 slots, but LLAMA_SM70_D256_MULTI_SEQ=%s is "
                     "already set - leaving it alone%c", multi_seq.c_str(), 10);
+        }
+        // The decode ubatch is slots x (1 + drafts) tokens wide, so the TC
+        // decode kernel's width ceiling follows the launch configuration rather
+        // than a hardcoded 8. The backend also accepts a value the user set.
+        if (common_get_env("LLAMA_SM70_D256_DEC_WMAX").empty()) {
+            bool spec_on = false;
+            for (auto t : params.speculative.types) {
+                if (t != COMMON_SPECULATIVE_TYPE_NONE) { spec_on = true; break; }
+            }
+            const int drafts = spec_on ? params.speculative.draft.n_max : 0;
+            const int dec_w  = params.n_parallel * (1 + drafts);
+            common_set_env("LLAMA_SM70_D256_DEC_WMAX", std::to_string(dec_w));
+            SRV_INF("decode width ceiling: %d (n_parallel %d x (1 + %d drafts))\n",
+                    dec_w, params.n_parallel, drafts);
         }
     }
 
