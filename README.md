@@ -217,7 +217,8 @@ LLAMA_SM70_D256_DEC_Q4=1 \
 | `-ub 16384` | OOM；8192 是预填充最优（预填充受每 ubatch 去量化限制） |
 | 单卡开 `LLAMA_SM70_SKINNY=2` | OOM（第二份权重拷贝），TP2 专用 |
 | 把 `q4-direct` 设默认 | 174k 下 kernel 慢 42%（窄 u16 载入）；只在显存吃紧时开 |
-| `-np > 1`（多序列同批） | D256 内核只实现单序列因果（因果基准由最后一行 mask 前缀探测）。现在**自动回落**：per-seq 缓存下混批的 `ne[3] != 1` 会被门禁拒绝；unified 缓存 + >1 槽由服务端置 `LLAMA_SM70_D256_MULTI_SEQ=1`，整进程走 stock。单序列批仍走内核 |
+| `-np > 1` + unified 池（`-kvu`） | prefill 直接用上了：内核改为**读 KQ mask**判可见性，不再从位置推因果（见 `docs/sm70-kvu-mask-driven.md`）。decode 仍走 stock，`q4/q8-direct` 与 SplitKV3 在该路径上也不启用。不带 `-kvu` 的 per-seq 缓存依旧拒绝（混批 `ne[3] != 1`） |
+| `-np > 1` 且手动置 `LLAMA_SM70_D256_MULTI_SEQ=0` | 整进程仍走 stock（与以前一致）；服务端不再覆盖你自己设的值 |
 | 含 Q8_0 权重的模型 + `LLAMA_SM70_SKINNY=2` | Q8_0 没有侧缓冲编解码，加载时会断言退出；保持 `SKINNY=0/1` 或换量化 |
 | 各种 kernel 编译选项微调 | 已经撞到累加器链上限，见「剩下的时间花在哪」 |
 
@@ -236,7 +237,7 @@ LLAMA_SM70_D256_DEC_Q4=1 \
 | `LLAMA_SM70_SKINNY` | `0` | q4_K 瘦身路径：`1` = 原地重排（不复制），`2` = 多一整份权重拷贝（本机 +1.1 GB/卡）。同时是 `IQ_SKINNY` 的开关前提。实测代价见「并发优先变体」 |
 | `LLAMA_SM70_IQ_SKINNY` | `0` | IQ 重排：174k 预填充 +4%、**解码不变**、side buffer +3.8 GB/卡。仅在 `LLAMA_SM70_SKINNY != 0` 时生效 |
 | `LLAMA_SM70_D256_DEBUG` | `0` | 打印 kernel 选择探针（ACCEPT/REJECT + 原因） |
-| `LLAMA_SM70_D256_MULTI_SEQ` | 由服务端设置 | unified KV + >1 槽时由 llama-server 置 `1`，整进程停用 D256 内核（内核只实现单序列因果）。手动跑其他前端时可自行设置 |
+| `LLAMA_SM70_D256_MULTI_SEQ` | 由服务端设置 | unified KV + >1 槽时由 llama-server 置 `1`：prefill 走 mask 驱动路径，decode 仍走 stock；不再整体停用 prefill 内核。手动跑其他前端时可自行设置；置 `0` 可强制回 stock（服务端不会覆盖你已设的值） |
 | `LLAMA_SM70_IQ_PARITY` | `0` | `1` = 首次 repack 时把每个类型的一个张量分别用侧缓冲展开和 stock kernel 去量化、逐值比对，打印 `nbad`（10/26 的 IQ3_S 全零权重就是这么定位的） |
 | `LLAMA_SM70_SKINNY_DEBUG_STOCK` | `0` | 调试切分：`1` = IQ 类张量强制走原始路径，`2` = k-quant 类走原始路径 |
 | `GGML_CUDA_P2P_AR_MAX_BYTES` | `176 MiB` | 单发 P2P allreduce 的消息窗口；`0` 关闭该路径 |
@@ -261,6 +262,8 @@ LLAMA_SM70_D256_DEC_Q4=1 \
 | GDN prologue 逐位 | 融合 vs stock `rms_norm+scale`，16,384 元素 | **0 个不同** |
 | 多模态 | 图片请求 200 + 描述正确 + 文本接受率 0.88 | **PASS** |
 | 回滚 | `LLAMA_SM70_D256=0` 与 stock 逐位一致 | **PASS** |
+| mask 驱动 prefill | 6 个统一池用例对 CPU f32 参考（单序列 / 4 槽连续 / 带洞 / 每 8 cell 交错 / 尾块 / 全空行），含 bounds kernel 对拍 | **6/6** |
+| 统一池端到端 | `-kvu -np 4`，mask 驱动 vs stock：每个请求贪心 token 全一致，单卡与 TP2 均如此；logprob 差值落在 stock 自身漂移带内 | **PASS** |
 
 去量化 parity gate 值得单独说：旧版本比较的是「内核出错后仍保持全零」的 host
 缓冲，于是对一个越界读 LUT 的 kernel 也打印 "BIT-EXACT"。现在的 gate 检查每次
@@ -425,6 +428,12 @@ CTA 会让 SM 网格闲着。三层工作解决了它：D256 张量核心解码 
 `verify/` —— 正确性与微基准：
 - `sm70_verify.cu` / `run.sh` —— 23 例 kernel harness，CPU f32 参考，kernel
   源码 md5 钉死；
+- `sm70_verify_maskmd.cu` / `run_maskmd.ps1` —— 统一池 mask 驱动 harness：6 例
+  （单序列 / 4 槽连续 / 带洞 / 每 8 cell 交错 / 尾块 / 全空行）对 CPU 参考，含
+  bounds kernel 对拍；
+- `kvu_gate.py` —— `-kvu -np N` 端到端门禁：同一请求模式分别跑
+  `LLAMA_SM70_D256=1` 与 `=0`，并各跑两遍做控制，用其调度漂移量作为 logprob
+  比较的判据基准；
 - `sm70_dequant_parity.cu` —— 真实 launch 的去量化 parity gate（查错、投毒输出）；
 - `sm70_attn_micro.cu` —— 生产几何的独立 D256 预填充基准（SplitKV3 / q4-direct /
   dense 可切换，带朴素参考校验）；

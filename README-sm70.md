@@ -235,7 +235,8 @@ llama.cpp native path automatically — no config needed.
 | `-ub 16384` | OOM; 8192 is the prefill optimum (prefill is dequant-bound per ubatch) |
 | `LLAMA_SM70_SKINNY=2` on one card | OOM (second weight copy); TP2-only |
 | `q4-direct` as default | 42% slower kernel at 174k (narrow u16 loads); opt-in for VRAM only |
-| `-np > 1` (several sequences in one ubatch) | the D256 kernel implements a single-sequence causal mask (it probes the last mask row for the live prefix). It now falls back on its own: with per-sequence caches a mixed batch has `ne[3] != 1` and is rejected; with a unified cache and more than one slot the server sets `LLAMA_SM70_D256_MULTI_SEQ=1` and the whole process stays on the stock path. Single-sequence batches keep the kernel |
+| `-np > 1` with a unified pool (`-kvu`) | prefill works: the kernel reads the KQ mask instead of deriving causality from positions (see `docs/sm70-kvu-mask-driven.md`). Decode stays on the stock path, and so do `q4/q8-direct` and SplitKV3 on this path. Per-sequence caches (no `-kvu`) are still rejected: a mixed batch has `ne[3] != 1` |
+| `-np > 1` with `LLAMA_SM70_D256_MULTI_SEQ=0` | the whole process stays on stock, as before - the server no longer overrides a value you set yourself |
 | a model with Q8_0 weights + `LLAMA_SM70_SKINNY=2` | there is no Q8_0 codec on the side-buffer route, and the load asserts; keep `SKINNY=0/1` or use another quant |
 | `-O3 --use_fast_math` style kernel tweaks | already at the accumulator-chain limit, see the ceiling section |
 
@@ -251,7 +252,7 @@ llama.cpp native path automatically — no config needed.
 | `LLAMA_SM70_D256_DEC_Q4` | `0` | q4_0 direct loads in the decode kernel |
 | `LLAMA_SM70_D256_SPLITS` | `0` | Decode KV-split cap override (`0` = auto `kv_len/920`, cap 48; max 256) |
 | `LLAMA_SM70_DEQUANT_FAST` | `1` | sm_70 iq3_s/iq3_xxs/iq4_xs dequant kernels; `0` = stock dequant |
-| `LLAMA_SM70_D256_MULTI_SEQ` | set by the server | llama-server sets it to `1` for a unified KV cache with more than one slot; the D256 kernels are then disabled process-wide (they implement a single-sequence causal mask). Set it yourself when embedding another frontend |
+| `LLAMA_SM70_D256_MULTI_SEQ` | set by the server | llama-server sets it to `1` for a unified KV cache with more than one slot: prefill then takes the mask-driven path and decode stays on stock. It no longer disables the prefill kernels. Set it yourself when embedding another frontend, and set it to `0` to force the stock path (the server will not override a value that is already set) |
 | `LLAMA_SM70_IQ_PARITY` | `0` | `1` = on the first repack, dequantize one tensor of each type both through the side buffer and through the stock kernel and compare value by value; prints `nbad` (this is how the 10/26 all-zero IQ3_S weights were found) |
 | `LLAMA_SM70_SKINNY_DEBUG_STOCK` | `0` | Debug split: `1` = force IQ types onto the stock path, `2` = force k-quant types onto the stock path |: `1` = in-place repack (no copy), `2` = second weight copy (+1.1 GB/card here). Also the gate for `IQ_SKINNY`. See "Concurrency-first variant" for the measured trade |
 | `LLAMA_SM70_IQ_SKINNY` | `0` | IQ repack: +4% prefill @174k, **no decode change**, +3.8 GB/card of side buffers. Only takes effect when `LLAMA_SM70_SKINNY != 0` |
@@ -278,6 +279,8 @@ Every change is guarded by gates; all are self-contained and re-runnable
 | GDN prologue bit-exact | fused vs stock `rms_norm+scale`, 16,384 elements | **0 differ** |
 | Multimodal | image request 200 + correct description + text acceptance 0.88 | **PASS** |
 | Rollback | `LLAMA_SM70_D256=0` reproduces stock bit-for-bit | **PASS** |
+| Mask-driven prefill | 6 unified-pool cases vs a CPU f32 reference (one sequence / 4 slots contiguous / holes / interleaved in runs of 8 / tail tile / empty row), plus the bounds kernel against the host | **6/6** |
+| Unified-pool e2e | `-kvu -np 4`, mask-driven vs stock: identical greedy ids on every request, single card and TP2; logprob deltas inside the drift stock shows against itself | **PASS** |
 
 The dequant parity gate is worth calling out: the previous version compared
 host buffers that stayed zero when a kernel faulted, so it printed "BIT-EXACT"
@@ -472,6 +475,12 @@ Everything is self-contained and runs on the physical box.
 `verify/` — correctness and microbenchmarks:
 - `sm70_verify.cu` / `run.sh` — 23-case kernel harness, CPU f32 reference, md5
   pin on the kernel source;
+- `sm70_verify_maskmd.cu` / `run_maskmd.ps1` — unified-pool mask-driven harness:
+  6 cases (one sequence / 4 slots contiguous / holes / interleaved in runs of 8 /
+  tail tile / empty row) against the CPU reference, bounds kernel included;
+- `kvu_gate.py` — end-to-end `-kvu -np N` gate: the same request pattern on
+  `LLAMA_SM70_D256=1` and `=0`, plus a run-it-twice control that measures the
+  scheduling drift floor the logprob comparison is judged against;
 - `sm70_dequant_parity.cu` — real-launch dequant parity gate (error-checked,
   poisoned outputs);
 - `sm70_attn_micro.cu` — standalone D256 prefill benchmark at production
