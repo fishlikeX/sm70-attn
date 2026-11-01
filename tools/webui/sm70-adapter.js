@@ -101,14 +101,28 @@
     return list.map((s, i) => {
       const dec = s.next_token && s.next_token[0] ? (s.next_token[0].n_decoded || 0) : 0;
       const pn = s.n_prompt_tokens || 0;
+      const cache = s.n_prompt_tokens_cache || 0;
+      const processed = s.n_prompt_tokens_processed || 0;
+      const busy = !!(s.is_processing || s.processing);
+      // n_prompt_tokens is the slot's whole token list, which keeps growing as
+      // tokens are generated; the prompt itself is pn - dec. The processed count
+      // excludes the prefix that came back from the cache, so prefill progress is
+      // (processed + cache) - comparing processed alone kept a resumed slot at
+      // "Reading prompt" forever (that is the 15% in the status pill).
+      const prompt_len = Math.max(0, pn - dec);
+      const done = Math.min(prompt_len, processed + cache);
       return {
         id: s.id ?? i,
         ctx: s.n_ctx || null,
-        used: pn + dec,
-        processing: !!(s.is_processing || s.processing),
-        prompt_n: pn || null,
-        prompt_read: s.n_prompt_tokens_processed || 0,
+        used: pn,                       // cells this slot holds (prompt + generated)
+        processing: busy,
+        prompt_n: prompt_len,
+        prompt_done: done,
+        prompt_cache: cache,
         n_decoded: dec,
+        // a slot is reading while it has not produced a token yet; once the first
+        // token is out it is decoding, whatever the prompt counters say
+        reading: busy && dec === 0,
       };
     });
   }
@@ -151,7 +165,7 @@
     const acceptPct = draftTotal ? (100 * accTotal) / draftTotal : null;
     push("spec_accept", acceptPct);
 
-    const prefillLeft = slotsInfo && slotsInfo.some((s2) => s2.processing && s2.prompt_read < (s2.prompt_n || 0));
+    const prefillLeft = slotsInfo && slotsInfo.some((s2) => s2.reading);
     const state = prefillLeft ? "reading" : processing ? "generating" : "idle";
     const live = {
       state,
@@ -166,10 +180,39 @@
       if (act) {
         live.prompt_tokens = act.prompt_n || null;
         live.prompt_total = act.prompt_n || null;
-        live.prompt_read = act.prompt_read != null ? act.prompt_read : (act.prompt_n || null);
+        live.prompt_read = act.prompt_done;
         live.generated = act.n_decoded || null;
       }
     }
+    // per-slot live state: the Batch slots card and the status pill read this.
+    // Speeds are diffs of each slot's own n_decoded between scrapes, so several
+    // concurrent requests show their own tok/s instead of the sum.
+    const prevSlots = S._slotPrev || {};
+    const nextPrev = {};
+    S._slotStart = S._slotStart || {};
+    live.slots = (slotsInfo || []).map((s2) => {
+      const prev = prevSlots[s2.id];
+      let tok_s = null;
+      if (s2.processing && s2.n_decoded > 0 && prev && s2.n_decoded >= prev.dec) {
+        const dt = Math.max(0.25, (now - prev.t) / 1000);
+        tok_s = (s2.n_decoded - prev.dec) / dt;
+      }
+      if (s2.processing && !S._slotStart[s2.id]) S._slotStart[s2.id] = now;
+      if (!s2.processing) S._slotStart[s2.id] = null;
+      const started = S._slotStart[s2.id];
+      nextPrev[s2.id] = { dec: s2.n_decoded, t: now };
+      return {
+        slot: s2.id,
+        state: s2.reading ? "reading" : s2.processing ? "decoding" : "idle",
+        generated: s2.n_decoded,
+        tok_s,
+        elapsed_s: s2.processing && started ? (now - started) / 1000 : null,
+        held_tokens: !s2.processing && s2.used ? s2.used : null,
+        prompt_pct: s2.prompt_n ? Math.min(100, (100 * s2.prompt_done) / s2.prompt_n) : null,
+      };
+    });
+    S._slotPrev = nextPrev;
+    live.waiting = g("llamacpp:requests_deferred");
 
     // GPU cards come from the launcher's local agent (sm70-gpu agent, same
     // origin); without it the cards show dashes instead of failing.
@@ -219,6 +262,32 @@
           push(`gpu${i}_power`, gpu.power ?? null);
         });
         push("disk_read", hwr.disk_read_mb ?? null);
+      }
+
+      // KV pool occupancy. The pool size is the -c value in the server's argv
+      // under -kvu; llama-server does not expose it (/props reports the per-slot
+      // context, 262144 here, not the 1M pool). Used cells are the slots' held
+      // tokens, which is what the unified pool charges for.
+      {
+        const cmd = srv && Array.isArray(srv.cmdline) ? srv.cmdline : [];
+        const argOf = (flags) => {
+          for (const f of flags) {
+            const i = cmd.indexOf(f);
+            if (i >= 0 && i + 1 < cmd.length) {
+              const v = Number(cmd[i + 1]);
+              if (v > 0) return v;
+            }
+          }
+          return null;
+        };
+        const unified = cmd.some((x) => x === "-kvu" || x === "--kv-unified");
+        const propsCtx = propsCache ? ((propsCache.default_generation_settings || {}).n_ctx || 0) : 0;
+        const cArg = argOf(["-c", "--ctx-size"]) || propsCtx;
+        const nSlots = slotsInfo && slotsInfo.length ? slotsInfo.length
+          : ((propsCache && propsCache.total_slots) || 1);
+        const pool = unified ? cArg : cArg * nSlots;
+        const used = slotsInfo ? slotsInfo.reduce((a, s2) => a + (s2.used || 0), 0) : 0;
+        live.kv = { used, pool, ratio: pool > 0 ? Math.min(1, used / pool) : null, unified };
       }
     } catch (e) { /* agent absent */ }
 

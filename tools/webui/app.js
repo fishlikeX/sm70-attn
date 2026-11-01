@@ -406,7 +406,7 @@ function render(m) {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
     setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
   } else if (live.state === "generating") {
-    setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+    setPill("generating", live.tok_s != null ? `Generating · ${fmt(live.tok_s, 1)} tok/s` : "Generating");
   } else {
     setPill("idle", "Idle");
   }
@@ -487,7 +487,7 @@ function renderMonitor(m) {
     label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+    detail = `${fmt(live.generated)} tokens${live.tok_s != null ? ` · ${fmt(live.tok_s, 1)} tok/s` : ""}`;
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
@@ -582,10 +582,20 @@ function renderMonitor(m) {
   setText("ctx-pct", `${Math.round(frac * 100)}%`);
   setText("ctx-sub", ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–");
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
-  setText("slots-text", `${fmt(requests.length)} requests · cache ${kfmt(totals.reused || 0)} tok reused`);
-  $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * (hw.gpus?.[1]?.mem_used || 0)) / hw.gpu_mem_total)}%` : "0%";
-  const kv = {q4_0: "q4_0 · SM70 direct", q8_0: "q8_0", f16: "f16"}[eng.kv] || eng.kv || "q4_0";
-  setText("kv-text", kv);
+  // request slots: what is busy right now (falls back to the counters when the
+  // engine does not report /slots)
+  const slotsLive = live.slots || [];
+  const busyNow = slotsLive.filter((s) => s.state !== "idle").length;
+  setText("slots-text", slotsLive.length
+    ? `${fmt(busyNow)} of ${fmt(slotsLive.length)} busy${live.waiting ? ` · ${fmt(live.waiting)} waiting` : ""}`
+    : `${fmt(requests.length)} requests · cache ${kfmt(totals.reused || 0)} tok reused`);
+  $("slots-bar").style.width = slotsLive.length ? `${Math.min(100, (100 * busyNow) / slotsLive.length)}%` : "0%";
+  // KV pool: cells held by the slots over the pool size (the -c value under -kvu)
+  const kvType = String(eng.kv || "q4_0").split(" ")[0];
+  const kvLive = live.kv;
+  setText("kv-text", kvLive && kvLive.pool
+    ? `${kvType} · ${fmt(100 * (kvLive.ratio || 0), 1)}% · ${fmt(kvLive.used)} / ${fmt(kvLive.pool)} cells`
+    : `${kvType} · SM70 direct`);
   setText("spec-text", "MTP, n_max 3");
   setText("kept-text", `${fmt(requests.length)} of ${fmt(keptCount)}`);
 
@@ -639,7 +649,9 @@ function renderMonitor(m) {
     $("slots-grid").innerHTML = slots.map((s) => {
       const busy = s.state !== "idle";
       const detail = !busy ? (s.held_tokens ? `${fmt(s.held_tokens)} tokens held for a next turn` : "free")
-        : `${s.state === "reading" ? "reading the prompt" : "decoding"} · ${fmt(s.generated)} tokens · ` +
+        : `${s.state === "reading"
+              ? `reading the prompt${s.prompt_pct != null ? ` · ${fmt(s.prompt_pct, 0)}%` : ""}`
+              : "decoding"} · ${fmt(s.generated)} tokens · ` +
           `${fmt(s.elapsed_s, 1)} s${s.tok_s != null ? ` · ${fmt(s.tok_s, 1)} tok/s` : ""}`;
       return `<div class="slot-row" data-state="${busy ? s.state : "idle"}">
         <span class="slot-row__n">Slot ${s.slot + 1}</span><span class="slot-row__state">${esc(s.state)}</span>
