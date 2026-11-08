@@ -596,6 +596,23 @@ function renderMonitor(m) {
   setText("kv-text", kvLive && kvLive.pool
     ? `${kvType} · ${fmt(100 * (kvLive.ratio || 0), 1)}% · ${fmt(kvLive.used)} / ${fmt(kvLive.pool)} cells`
     : `${kvType} · SM70 direct`);
+
+  // KV pool gauge: only meaningful under -kvu, where the pool is the whole -c budget
+  // rather than one slot's context
+  const kvGauge = $("kv-gauge");
+  if (kvGauge) {
+    if (kvLive && kvLive.unified && kvLive.pool > 0) {
+      const kfrac = Math.min(1, kvLive.ratio || 0);
+      const karc = 235.6 * kfrac;
+      kvGauge.hidden = false;
+      $("kv-fill").setAttribute("stroke-dasharray", `${karc.toFixed(1)} 314.2`);
+      $("kv-fill").style.opacity = karc >= 3 ? "1" : "0";  // same rule as the context gauge
+      setText("kv-pct", `${Math.round(kfrac * 100)}%`);
+      setText("kv-gauge-sub", `${kfmt(kvLive.used)} / ${kfmt(kvLive.pool)}`);
+    } else {
+      kvGauge.hidden = true;
+    }
+  }
   setText("spec-text", "MTP, n_max 3");
   setText("kept-text", `${fmt(requests.length)} of ${fmt(keptCount)}`);
 
