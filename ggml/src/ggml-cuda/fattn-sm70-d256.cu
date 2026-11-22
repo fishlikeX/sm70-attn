@@ -314,7 +314,19 @@ static void sm70_dump_kernel_inputs(
 static void sm70_d256_probe(const char * reason, int cc,
                             const ggml_tensor * Q, const ggml_tensor * K,
                             const ggml_tensor * V, const ggml_tensor * mask) {
-    static const bool verbose = getenv("LLAMA_SM70_D256_DEBUG") != nullptr;
+    // 0 = silent, 1 = summary (default, 5 real + 20 placeholders), 2 = every call.
+    // A bare `=0` used to turn verbose output on, because only the variable's presence was
+    // checked. See issue #6.
+    static const int probe_mode = [] {
+        const char * e = getenv("LLAMA_SM70_D256_DEBUG");
+        if (e == nullptr) {
+            return 1;
+        }
+        return atoi(e) <= 0 ? 0 : 2;
+    }();
+    if (probe_mode == 0) {
+        return;
+    }
     // Three classes of dispatch:
     //  * template: graph-build placeholders (any q_len incl. the 512-batch
     //    template; KV/mask views carry the FULL cache capacity)
@@ -342,7 +354,7 @@ static void sm70_d256_probe(const char * reason, int cc,
     if (K->ne[1] > kv_max_seen) { kv_max_seen = K->ne[1]; }
     static int printed_ph = 0;
     static int printed_real = 0;
-    if (!verbose && (real ? printed_real >= 5 : printed_ph >= 20)) {
+    if (probe_mode != 2 && (real ? printed_real >= 5 : printed_ph >= 20)) {
         return;
     }
     if (real) { printed_real++; } else { printed_ph++; }

@@ -202,10 +202,10 @@
       "desc_zh": "小消息用 bf16 压缩的阈值（默认 1；0 关闭）。会改变结果。"
     },
     {
-      "name": "LLAMA_SM70_D256_DEBUG", "default": "0", "kind": "bool",
+      "name": "LLAMA_SM70_D256_DEBUG", "default": "0", "kind": "enum", "choices": ["0", "1", "2"],
       "group": "debug", "tier": "advanced", "risk": "debug",
-      "desc": "Print the D256 kernel selection probe (ACCEPT/REJECT + reason). First decision per class by default.",
-      "desc_zh": "打印 D256 kernel 的选择探针（ACCEPT/REJECT + 原因）。默认只打每类第一次决策。"
+      "desc": "D256 kernel selection probe: 0 = silent, 1 = first decision per class, 2 = every call. Unset defaults to 1.",
+      "desc_zh": "D256 kernel 选择探针：0 = 静默，1 = 每类第一次决策，2 = 每次调用。不设置时等同 1。"
     },
     {
       "name": "LLAMA_SM70_IQ_PARITY", "default": "0", "kind": "bool",
